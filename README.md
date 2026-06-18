@@ -1,0 +1,98 @@
+# esp32.communicator
+
+![Version](https://img.shields.io/badge/version-1.5.0-blue)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+[![Donate](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://www.paypal.com/donate/?business=martin%40bchmnn.de&currency_code=EUR)
+
+> **ESP32 Messenger** — Nachrichten zwischen ESP32-Boards per ESP-NOW, parallel zu WiFi und [iobroker.esp-hub](https://github.com/MPunktBPunkt/iobroker.esp-hub).
+
+---
+
+## Überblick
+
+Mehrere ESP32-Geräte tauschen Textnachrichten und Anruf-Signale direkt aus — ohne Router, mit ~200 m Reichweite im Freien. Gleichzeitig bleiben sie per WiFi im Heimnetz und melden Statistiken an den ESP-Hub. Web-UI mit Chat, Peer-Liste und Live-Updates via SSE.
+
+---
+
+## Features
+
+- **ESP-NOW Messaging** — Broadcast oder Unicast an bekannte MAC
+- **Peer-Discovery** — automatisches Hello alle 5 s
+- **Anruf-Signalisierung** — Klingeln, Annehmen, Auflegen (ohne Audio)
+- **Web-UI** — Chat, Geräteliste, Status mit Gauges
+- **SSE** — Echtzeit-Updates ohne Polling
+- **WiFi + ESP-NOW parallel** — Hub-Integration bleibt aktiv
+- **ESP-Hub** — peers, sent, recv, unread als IO-Werte
+- **OTA** — Hub-Push oder Browser
+
+---
+
+## Voraussetzungen
+
+| Typ | Details |
+|-----|---------|
+| **Board** | ESP32, Arduino ESP32 **≥ 3.0** |
+| **WiFiManager** | tablatronix / tzapu |
+| **ArduinoJson** | bblanchon v6 oder v7 |
+| **ioBroker** | [iobroker.esp-hub](https://github.com/MPunktBPunkt/iobroker.esp-hub) |
+
+---
+
+## Quickstart
+
+1. Pro Gerät eindeutigen Namen setzen:
+
+```cpp
+#define DEVICE_NAME   "Communicator-1"
+#define HUB_HOST      "192.168.178.113"
+#define HUB_PORT      8093
+```
+
+2. Sketch auf alle ESPs flashen
+3. Hotspot **`ESP-Comm-Setup`** → WLAN + Hub-IP
+4. `http://<ESP-IP>/` oder `http://espcomm-<name>.local/`
+
+> **Wichtig:** Alle Communicatoren müssen auf dem **selben WiFi-Kanal** sein (BSSID-Lock im Status-Tab).
+
+---
+
+## Web-Oberfläche
+
+| Tab | Inhalt |
+|-----|--------|
+| **Chat** | Nachrichten senden/empfangen, Emojis, Name ändern |
+| **Geräte** | Bekannte Peers, Online-Status, Anrufen |
+| **Status** | RSSI/Heap-Gauges, Kanal, Hub-Info |
+| **OTA** | Firmware-Update |
+
+---
+
+## ioBroker-Integration (ESP-Hub)
+
+```
+esp-hub.0.devices.<MAC>.ios/
+├── peers    ← bekannte ESPs
+├── sent     ← gesendete Nachrichten
+├── recv     ← empfangene Nachrichten
+└── unread   ← ungelesen
+```
+
+---
+
+## API (Auszug)
+
+| Methode | Pfad | Beschreibung |
+|---------|------|--------------|
+| GET | `/api/messages` | Posteingang |
+| POST | `/api/send` | `{to, text}` senden |
+| POST | `/api/call` | Anruf-Signal |
+| GET | `/api/peers` | Geräteliste |
+| GET | `/api/sse` | Server-Sent Events |
+
+---
+
+## Lizenz
+
+GNU General Public License v3.0 © MPunktBPunkt — siehe [LICENSE](LICENSE)
+
+[![Donate](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://www.paypal.com/donate/?business=martin%40bchmnn.de&currency_code=EUR)
