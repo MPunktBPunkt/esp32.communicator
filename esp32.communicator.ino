@@ -346,8 +346,8 @@ bool isBroadcastMac(const uint8_t* mac) {
 
 String escJson(const String& s) {
     String r = s;
-    r.replace("\\", "\\\\");
-    r.replace("\"", "\\\"");
+    r.replace("\\", "\\");
+    r.replace("\"", "\"");
     r.replace("\n", "\\n");
     r.replace("\r", "");
     return r;
@@ -2097,7 +2097,7 @@ void handleApiBssidLock() {
     char msg[80];
     snprintf(msg, sizeof(msg), "BSSID-Lock gesetzt: %s (Kanal %d)", s, WiFi.channel());
     logEvent(msg);
-    webServer.send(200, "application/json", "{\"ok\":true,\"bssid\":\"" + lockedBssid + "\"}");
+    webServer.send(200, "application/json", "{\"ok\":true,\"bssid\":\"\" + lockedBssid + \"\"}");
 }
 
 void handleApiBssidClear() {
@@ -2120,7 +2120,7 @@ void handleApiStatus() {
 // POST /api/call  {to: "MAC", action: "ring"|"accept"|"reject"|"end"}
 void handleApiCall() {
     if (!webServer.hasArg("plain")) {
-        webServer.send(400, "application/json", "{"ok":false}"); return;
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
     }
 #if ARDUINOJSON_VERSION_MAJOR >= 7
     JsonDocument doc;
@@ -2128,14 +2128,14 @@ void handleApiCall() {
     DynamicJsonDocument doc(256);
 #endif
     if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
-        webServer.send(400, "application/json", "{"ok":false}"); return;
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
     }
     String action = doc["action"].as<String>();
     String toStr  = doc["to"].as<String>();
 
     uint8_t toMac[6];
     if (!parseMacStr(toStr, toMac)) {
-        webServer.send(400, "application/json", "{"ok":false,"error":"MAC ungueltig"}");
+        webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"MAC ungueltig\"}");
         return;
     }
 
@@ -2163,20 +2163,20 @@ void handleApiCall() {
         memset(&callState, 0, sizeof(callState));
     }
     else {
-        webServer.send(400, "application/json", "{"ok":false,"error":"Unbekannte Aktion"}");
+        webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Unbekannte Aktion\"}");
         return;
     }
     espNowCall(toMac, callType);
     char evtbuf[80];
     snprintf(evtbuf, sizeof(evtbuf), "Anruf %s an %s", action.c_str(), callState.peerName);
     logEvent(evtbuf);
-    webServer.send(200, "application/json", "{"ok":true}");
+    webServer.send(200, "application/json", "{\"ok\":true}");
 }
 
 // POST /api/set-name  {name: "Neuer Name"}
 void handleApiSetName() {
     if (!webServer.hasArg("plain")) {
-        webServer.send(400, "application/json", "{"ok":false}"); return;
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
     }
 #if ARDUINOJSON_VERSION_MAJOR >= 7
     JsonDocument doc;
@@ -2184,12 +2184,12 @@ void handleApiSetName() {
     DynamicJsonDocument doc(128);
 #endif
     if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
-        webServer.send(400, "application/json", "{"ok":false}"); return;
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
     }
     String newName = doc["name"].as<String>();
     newName.trim();
     if (newName.length() == 0 || newName.length() > 31) {
-        webServer.send(400, "application/json", "{"ok":false,"error":"Name 1-31 Zeichen"}");
+        webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Name 1-31 Zeichen\"}");
         return;
     }
     deviceName = newName;
@@ -2203,7 +2203,7 @@ void handleApiSetName() {
     String mdns = "espcomm-" + toMdnsName(deviceName);
     MDNS.begin(mdns.c_str());
     ssePush("status", handleApiStatusJson());
-    webServer.send(200, "application/json", "{"ok":true,"name":"" + escJson(newName) + ""}");
+    webServer.send(200, "application/json", "{\"ok\":true,\"name\":\"" + escJson(newName) + "\"}");
 }
 
 void handleNotFound() {
