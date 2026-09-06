@@ -1,6 +1,6 @@
 # esp32.communicator
 
-![Version](https://img.shields.io/badge/version-1.5.0-blue)
+![Version](https://img.shields.io/badge/version-1.6.0-blue)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://www.paypal.com/donate/?business=martin%40bchmnn.de&currency_code=EUR)
 
@@ -18,12 +18,14 @@ Mehrere ESP32-Geräte tauschen Textnachrichten und Anruf-Signale direkt aus — 
 
 - **ESP-NOW Messaging** — Broadcast oder Unicast an bekannte MAC
 - **Peer-Discovery** — automatisches Hello alle 5 s
-- **Anruf-Signalisierung** — Klingeln, Annehmen, Auflegen (ohne Audio)
-- **Web-UI** — Chat, Geräteliste, Status mit Gauges
+- **WebRTC-Anrufe** — Klingeln/Annehmen über ESP-NOW; Audio/Video im Browser via Hub-Signaling (`/api/webrtc`)
+- **Web-UI** — Chat, Geräteliste, Status mit Gauges, Anruf-Buttons
 - **SSE** — Echtzeit-Updates ohne Polling
 - **WiFi + ESP-NOW parallel** — Hub-Integration bleibt aktiv
 - **ESP-Hub** — peers, sent, recv, unread als IO-Werte
 - **OTA** — Hub-Push oder Browser
+
+> **Hinweis Anrufe:** Browser brauchen für Kamera/Mikrofon einen Secure Context. Unter `http://` im LAN ggf. Origin freigeben (z. B. Chrome „Insecure origins treated as secure“) oder HTTPS. Beide Web-UIs müssen während des Anrufs geöffnet sein.
 
 ---
 
@@ -34,7 +36,7 @@ Mehrere ESP32-Geräte tauschen Textnachrichten und Anruf-Signale direkt aus — 
 | **Board** | ESP32, Arduino ESP32 **≥ 3.0** |
 | **WiFiManager** | tablatronix / tzapu |
 | **ArduinoJson** | bblanchon v6 oder v7 |
-| **ioBroker** | [iobroker.esp-hub](https://github.com/MPunktBPunkt/iobroker.esp-hub) |
+| **ioBroker** | [iobroker.esp-hub](https://github.com/MPunktBPunkt/iobroker.esp-hub) **≥ 0.5.8** |
 
 ---
 

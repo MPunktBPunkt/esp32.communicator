@@ -57,7 +57,7 @@
 #define DEVICE_NAME            "Communicator-1"
 
 // Firmware-Version
-#define FW_VERSION             "1.5.0 communicator"
+#define FW_VERSION             "1.6.0 communicator"
 
 // ioBroker Host-IP (für Hub-Heartbeat)
 #define HUB_HOST               "192.168.178.113"
@@ -1147,6 +1147,8 @@ String handleApiStatusJson() {
     json += "\"recv\":" + String(recvTotal) + ",";
     json += "\"unread\":" + String(unreadCount) + ",";
     json += "\"bssid\":\"" + lockedBssid + "\",";
+    json += "\"hubHost\":\"" + escJson(hubHost) + "\",";
+    json += "\"hubPort\":" + String(hubPort) + ",";
     json += "\"version\":\"" + String(FW_VERSION) + "\"";
     json += "}";
     return json;
@@ -1281,6 +1283,11 @@ td:first-child{color:#8b949e;width:42%}
   padding:5px 12px;border-radius:16px;cursor:pointer;font-size:12px;
   font-weight:600;display:inline-flex;align-items:center;gap:4px}
 .btn-call-sm:hover{background:#238636;color:#fff}
+.rtc-media{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}
+.rtc-media video{background:#0d1117;border:1px solid #30363d;border-radius:8px;
+  width:140px;height:105px;object-fit:cover}
+.rtc-media video#rtc-local{transform:scaleX(-1)}
+.rtc-hint{font-size:11px;color:#8b949e;margin-top:8px}
 .name-form{display:flex;gap:8px;margin-top:8px}
 .name-form input{flex:1;padding:6px 10px;font-size:13px}
 .name-form button{background:#238636;color:#fff;border:none;
@@ -1396,7 +1403,15 @@ td:first-child{color:#8b949e;width:42%}
             h4 += online ? "bc-green" : "bc-red";
             h4 += "'>";
             h4 += online ? "online" : "offline";
-            h4 += "</span></div>";
+            h4 += "</span>";
+            if (online) {
+                h4 += "<button class='btn-call-sm' onclick='event.stopPropagation();startCall(\"";
+                h4 += String(ms);
+                h4 += "\",\"";
+                h4 += escHtml(String(p.name));
+                h4 += "\")'>&#128222; Anruf</button>";
+            }
+            h4 += "</div>";
         }
     }
     h4 += "</div></div></div>\n";
@@ -1475,8 +1490,50 @@ td:first-child{color:#8b949e;width:42%}
         "</div></div>\n"
     );
 
-    // ── Chunk 7: Toast + Script ──────────────────────────────────
-    webServer.sendContent(R"rawjs(<div id="toast"></div>
+    // ── Chunk 7: Call modals + Toast + Script ────────────────────
+    {
+        String cfg;
+        cfg.reserve(200);
+        cfg = "<script>window.COMM_CFG={mac:'";
+        cfg += getMac();
+        cfg += "',macFmt:'";
+        cfg += getMacFmt();
+        cfg += "',hub:'http://";
+        cfg += hubHost;
+        cfg += ":";
+        cfg += String(hubPort);
+        cfg += "'};</script>\n";
+        webServer.sendContent(cfg);
+    }
+    webServer.sendContent(R"rawjs(
+<div id="call-modal" class="modal-overlay">
+  <div class="modal">
+    <div class="call-avatar" id="call-avatar">&#128222;</div>
+    <h2 id="call-title">Eingehender Anruf</h2>
+    <p id="call-from">-</p>
+    <div class="call-btns">
+      <button class="btn-call" onclick="acceptCall()">Annehmen</button>
+      <button class="btn-hangup" onclick="rejectCall()">Ablehnen</button>
+    </div>
+  </div>
+</div>
+<div id="active-call-modal" class="modal-overlay">
+  <div class="modal" style="max-width:420px">
+    <h2 id="active-call-name">Anruf</h2>
+    <p id="active-call-duration">00:00</p>
+    <div class="rtc-media">
+      <video id="rtc-remote" autoplay playsinline></video>
+      <video id="rtc-local" autoplay playsinline muted></video>
+    </div>
+    <div class="call-btns">
+      <button class="btn-sm" id="rtc-cam-btn" onclick="toggleCam()">Kamera</button>
+      <button class="btn-sm" id="rtc-mic-btn" onclick="toggleMic()">Mikro</button>
+      <button class="btn-hangup" onclick="endCall()">Auflegen</button>
+    </div>
+    <div class="rtc-hint">Audio/Video im Browser (WebRTC). Signaling &uuml;ber ESP-Hub.</div>
+  </div>
+</div>
+<div id="toast"></div>
 <script>
 // ── Tab-Switching ──────────────────────────────────────────────
 function showTab(id,btn){
@@ -1531,29 +1588,8 @@ function clearChat(){
   });
 }
 
-// ── Peer-Liste ────────────────────────────────────────────────
-function loadPeers(){
-  fetch('/api/peers').then(r=>r.json()).then(peers=>{
-    var el=document.getElementById('peer-list');
-    var pc=document.getElementById('peer-cnt');
-    if(pc)pc.textContent=peers.length;
-    if(!peers.length){el.innerHTML='<div class="empty">Noch keine Ger\u00e4te</div>';return;}
-    el.innerHTML=peers.map(p=>
-      `<div class="peer-card" onclick="selectPeer('${p.mac}','${p.name.replace(/'/g,'')}')">
-        <div class="peer-dot" style="background:${p.online?'#3fb950':'#555'}"></div>
-        <div style="flex:1"><div class="peer-name">${p.name}</div>
-        <div class="peer-mac">${p.mac}</div></div>
-        <span class="badge ${p.online?'bc-green':'bc-red'}">${p.online?'online':'offline'}</span>
-      </div>`
-    ).join('');
-    // Dropdown aktualisieren
-    var sel=document.getElementById('sel-to');
-    var cur=sel.value;
-    sel.innerHTML='<option value="bc">\uD83D\uDCE2 An alle (Broadcast)</option>'
-      +peers.map(p=>`<option value="${p.mac}">${p.name} (${p.mac.substring(12)})</option>`).join('');
-    if([...sel.options].some(o=>o.value===cur))sel.value=cur;
-  });
-}
+function normMac(m){return String(m||'').replace(/[^a-fA-F0-9]/g,'').toUpperCase();}
+
 function selectPeer(mac,name){
   document.getElementById('sel-to').value=mac;
   showTab('chat',document.querySelector('.tab'));
@@ -1639,15 +1675,128 @@ document.querySelectorAll('.tab')[2].addEventListener('click',function(){
   if(!rssiGauge)setTimeout(initGauges,100);
 });
 
-// ── Call-Logik ────────────────────────────────────────────────
-var callMac=null, callTimer=null, callSeconds=0;
+// ── WebRTC Call (Browser media + Hub signaling + ESP-NOW ring) ─
+var CFG=window.COMM_CFG||{};
+var MY_MAC=normMac(CFG.mac||'');
+var HUB_BASE=CFG.hub||'';
+var callMac=null, callName='', callRole=null, callTimer=null, callSeconds=0;
+var pc=null, localStream=null, rtcPoll=null, rtcAfter=0, camOn=true, micOn=true;
+
+function hubUrl(path){return HUB_BASE+path;}
+
+function rtcPost(to,type,payload){
+  if(!HUB_BASE||!MY_MAC)return Promise.reject(new Error('kein Hub'));
+  return fetch(hubUrl('/api/webrtc'),{method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({from:MY_MAC,to:normMac(to),type:type,payload:payload||null})});
+}
+
+function startRtcPoll(){
+  stopRtcPoll();
+  if(!HUB_BASE||!MY_MAC)return;
+  rtcPoll=setInterval(async()=>{
+    try{
+      var r=await fetch(hubUrl('/api/webrtc?mac='+encodeURIComponent(MY_MAC)+'&after='+rtcAfter));
+      var d=await r.json();
+      if(!d.ok||!d.signals)return;
+      for(var i=0;i<d.signals.length;i++){
+        var s=d.signals[i];
+        if(s.id>rtcAfter)rtcAfter=s.id;
+        await handleRtcSignal(s);
+      }
+    }catch(e){}
+  },800);
+}
+function stopRtcPoll(){if(rtcPoll){clearInterval(rtcPoll);rtcPoll=null;}}
+
+async function ensureMedia(){
+  if(localStream)return localStream;
+  localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:{facingMode:'user',width:{ideal:320},height:{ideal:240}}});
+  var lv=document.getElementById('rtc-local');
+  if(lv){lv.srcObject=localStream;lv.muted=true;}
+  return localStream;
+}
+
+function makePc(peerMac){
+  if(pc){try{pc.close();}catch(e){}}
+  pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
+  pc.onicecandidate=ev=>{
+    if(ev.candidate)rtcPost(peerMac,'ice',ev.candidate).catch(()=>{});
+  };
+  pc.ontrack=ev=>{
+    var rv=document.getElementById('rtc-remote');
+    if(rv)rv.srcObject=ev.streams[0];
+  };
+  pc.onconnectionstatechange=()=>{
+    if(pc&&(pc.connectionState==='failed'||pc.connectionState==='disconnected'||pc.connectionState==='closed')){
+      /* keep UI; user can hang up */
+    }
+  };
+  return pc;
+}
+
+async function handleRtcSignal(s){
+  if(!callMac||normMac(s.from)!==normMac(callMac))return;
+  if(s.type==='offer'&&callRole==='callee'){
+    await ensureMedia();
+    makePc(callMac);
+    localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+    await pc.setRemoteDescription(s.payload);
+    var ans=await pc.createAnswer();
+    await pc.setLocalDescription(ans);
+    await rtcPost(callMac,'answer',ans);
+  } else if(s.type==='answer'&&callRole==='caller'){
+    if(pc)await pc.setRemoteDescription(s.payload);
+  } else if(s.type==='ice'){
+    if(pc&&s.payload){try{await pc.addIceCandidate(s.payload);}catch(e){}}
+  } else if(s.type==='bye'){
+    cleanupRtc(false);
+    toast('Anruf beendet',false);
+  }
+}
+
+async function beginRtcAsCaller(){
+  callRole='caller';
+  startRtcPoll();
+  try{
+    await ensureMedia();
+    makePc(callMac);
+    localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
+    var offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await rtcPost(callMac,'offer',offer);
+  }catch(e){
+    toast('Kamera/Mikro: '+e.message,false);
+  }
+}
+
+async function beginRtcAsCallee(){
+  callRole='callee';
+  startRtcPoll();
+  try{await ensureMedia();}catch(e){toast('Kamera/Mikro: '+e.message,false);}
+}
+
+function cleanupRtc(sendBye){
+  document.getElementById('call-modal').classList.remove('show');
+  document.getElementById('active-call-modal').classList.remove('show');
+  if(callTimer){clearInterval(callTimer);callTimer=null;}
+  stopRtcPoll();
+  if(sendBye&&callMac)rtcPost(callMac,'bye',null).catch(()=>{});
+  if(pc){try{pc.close();}catch(e){} pc=null;}
+  if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null;}
+  var lv=document.getElementById('rtc-local'), rv=document.getElementById('rtc-remote');
+  if(lv)lv.srcObject=null; if(rv)rv.srcObject=null;
+  callMac=null; callName=''; callRole=null; callSeconds=0; camOn=true; micOn=true;
+}
 
 function startCall(mac,name){
-  if(callMac){toast('Bereits im Gespräch',false);return;}
-  callMac=mac;
-  document.getElementById('active-call-name').textContent='Rufe an: '+name+'...';
+  if(callMac){toast('Bereits im Gespr\u00e4ch',false);return;}
+  if(!HUB_BASE){toast('Kein Hub konfiguriert',false);return;}
+  callMac=mac; callName=name||mac; callRole=null;
+  document.getElementById('active-call-name').textContent='Rufe an: '+callName+'...';
   document.getElementById('active-call-duration').textContent='Klingelt...';
   document.getElementById('active-call-modal').classList.add('show');
+  startRtcPoll();
   fetch('/api/call',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({to:mac,action:'ring'})})
@@ -1658,7 +1807,7 @@ function acceptCall(){
   document.getElementById('call-modal').classList.remove('show');
   var mac=document.getElementById('call-modal').dataset.mac;
   var name=document.getElementById('call-from').textContent;
-  callMac=mac; callSeconds=0;
+  callMac=mac; callName=name; callSeconds=0;
   document.getElementById('active-call-name').textContent='Verbunden: '+name;
   startCallTimer();
   document.getElementById('active-call-modal').classList.add('show');
@@ -1666,6 +1815,7 @@ function acceptCall(){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({to:mac,action:'accept'})})
   .catch(()=>{});
+  beginRtcAsCallee();
 }
 
 function rejectCall(){
@@ -1679,15 +1829,28 @@ function rejectCall(){
 }
 
 function endCall(){
-  document.getElementById('active-call-modal').classList.remove('show');
-  if(callTimer){clearInterval(callTimer);callTimer=null;}
   if(callMac){
     fetch('/api/call',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({to:callMac,action:'end'})})
     .catch(()=>{});
   }
-  callMac=null; callSeconds=0;
+  cleanupRtc(true);
+}
+
+function toggleCam(){
+  if(!localStream)return;
+  camOn=!camOn;
+  localStream.getVideoTracks().forEach(t=>t.enabled=camOn);
+  var b=document.getElementById('rtc-cam-btn');
+  if(b)b.textContent=camOn?'Kamera':'Kamera aus';
+}
+function toggleMic(){
+  if(!localStream)return;
+  micOn=!micOn;
+  localStream.getAudioTracks().forEach(t=>t.enabled=micOn);
+  var b=document.getElementById('rtc-mic-btn');
+  if(b)b.textContent=micOn?'Mikro':'Mikro aus';
 }
 
 function startCallTimer(){
@@ -1701,11 +1864,9 @@ function startCallTimer(){
   },1000);
 }
 
-// SSE Call-Events verarbeiten
 function handleCallEvent(data){
   var d=JSON.parse(data);
   if(d.type==='ring'){
-    // Eingehender Anruf
     var modal=document.getElementById('call-modal');
     modal.dataset.mac=d.mac;
     document.getElementById('call-title').textContent='Eingehender Anruf';
@@ -1713,15 +1874,12 @@ function handleCallEvent(data){
     document.getElementById('call-avatar').textContent='\u{1F4DE}';
     modal.classList.add('show');
   } else if(d.type==='accept'){
-    // Anruf angenommen (outgoing)
     document.getElementById('active-call-name').textContent='Verbunden mit '+d.from;
     startCallTimer();
-  } else if(d.type==='end'||d.type==='timeout'){
-    document.getElementById('call-modal').classList.remove('show');
-    document.getElementById('active-call-modal').classList.remove('show');
-    if(callTimer){clearInterval(callTimer);callTimer=null;}
-    callMac=null;
-    toast(d.type==='timeout'?'Kein Annehmen':'Anruf beendet',false);
+    beginRtcAsCaller();
+  } else if(d.type==='end'||d.type==='timeout'||d.type==='reject'){
+    cleanupRtc(false);
+    toast(d.type==='timeout'?'Kein Annehmen':(d.type==='reject'?'Abgelehnt':'Anruf beendet'),false);
   }
 }
 
@@ -1816,16 +1974,19 @@ function updateStatus(d){
 
 function renderPeerList(peers){
   var el=document.getElementById('peer-list');
-  var pc=document.getElementById('peer-cnt');if(pc)pc.textContent=peers.length;
+  var cnt=document.getElementById('peer-cnt');if(cnt)cnt.textContent=peers.length;
   if(!peers.length){el.innerHTML='<div class="empty">Noch keine Ger\u00e4te</div>';return;}
-  el.innerHTML=peers.map(p=>
-    `<div class="peer-card" onclick="selectPeer('${p.mac}','${p.name.replace(/'/g,'')}')">
+  el.innerHTML=peers.map(p=>{
+    var nm=(p.name||'').replace(/'/g,'').replace(/"/g,'');
+    var callBtn=p.online?`<button class="btn-call-sm" onclick="event.stopPropagation();startCall('${p.mac}','${nm}')">\uD83D\uDCDE Anruf</button>`:'';
+    return `<div class="peer-card" onclick="selectPeer('${p.mac}','${nm}')">
       <div class="peer-dot" style="background:${p.online?'#3fb950':'#555'}"></div>
       <div style="flex:1"><div class="peer-name">${p.name}</div>
       <div class="peer-mac">${p.mac}</div></div>
       <span class="badge ${p.online?'bc-green':'bc-red'}">${p.online?'online':'offline'}</span>
-    </div>`
-  ).join('');
+      ${callBtn}
+    </div>`;
+  }).join('');
 }
 
 function updateDropdown(peers){
