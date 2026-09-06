@@ -56,6 +56,19 @@ Mehrere ESP32-Geräte tauschen Textnachrichten und Anruf-Signale direkt aus — 
 
 ---
 
+## Vorkompilierte Firmware
+
+Schema: `{name}.{version}.{family}.bin` (`esp32` = klassisch/D1 Mini, `esp32s3` = ESP32-S3)
+
+| Datei | Board |
+|-------|-------|
+| `communicator.1.4.2.esp32.bin` | ESP32 / D1 Mini |
+| `communicator.1.4.2.esp32s3.bin` | ESP32-S3 |
+
+> Hinweis: Die .bins im Repo sind **1.4.2**; der Sketch-Stand ist **1.5.0**. Neu kompilieren für aktuelle Features.
+
+---
+
 ## Web-Oberfläche
 
 | Tab | Inhalt |
