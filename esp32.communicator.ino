@@ -1,7 +1,7 @@
 // ╔══════════════════════════════════════════════════════════════╗
 // ║  esp32.communicator.ino                                     ║
-// ║  Version: 1.5.0                                             ║
-// ║  Basis: esp-hub-base v1.5.0                                 ║
+// ║  Version: 1.8.0                                             ║
+// ║  Basis: esp-hub-base v1.7.0                                 ║
 // ╠══════════════════════════════════════════════════════════════╣
 // ║  Kommunikation:                                             ║
 // ║    ESP-NOW  — direkte Nachrichten ohne Router               ║
@@ -57,7 +57,7 @@
 #define DEVICE_NAME            "Communicator-1"
 
 // Firmware-Version
-#define FW_VERSION             "1.6.0 communicator"
+#define FW_VERSION             "1.8.0 communicator"
 
 // ioBroker Host-IP (für Hub-Heartbeat)
 #define HUB_HOST               "192.168.178.113"
@@ -149,7 +149,8 @@ typedef struct __attribute__((packed)) {
 
 struct InboxEntry {
     char     fromName[32];
-    char     fromMac[18];
+    char     fromMac[18];   // Absender-MAC (bei gesendet: eigene)
+    char     peerMac[18];   // Gesprächspartner, oder "bc" bei Broadcast
     char     text[200];
     uint32_t timestamp;
     uint32_t msgId;
@@ -175,6 +176,17 @@ WebServer    webServer(80);
 String       deviceName = DEVICE_NAME;
 String       hubHost    = HUB_HOST;
 int          hubPort    = HUB_PORT;
+
+// PIN / Session (Web-UI Schutz)
+String       pinHashStored = "";
+#define MAX_SESSIONS 4
+#define SESSION_TTL_MS (86400000UL)  // 24h
+struct WebSession {
+    char     token[17];
+    uint32_t created;
+    bool     used;
+};
+WebSession   webSessions[MAX_SESSIONS];
 
 // Inbox (circular buffer)
 InboxEntry   inbox[MAX_INBOX];
@@ -441,6 +453,12 @@ void inboxAdd(const char* fromName, const char* fromMac,
     InboxEntry& e = inbox[inboxNext % MAX_INBOX];
     strncpy(e.fromName, fromName, 31); e.fromName[31] = 0;
     strncpy(e.fromMac,  fromMac,  17); e.fromMac[17]  = 0;
+    if (isBcast) {
+        strncpy(e.peerMac, "bc", 17);
+    } else {
+        strncpy(e.peerMac, fromMac, 17);
+    }
+    e.peerMac[17] = 0;
     strncpy(e.text,     text,    199); e.text[199]    = 0;
     e.timestamp   = millis() / 1000UL;
     e.msgId       = msgId;
@@ -469,6 +487,67 @@ void inboxMarkAllRead() {
     unreadCount = 0;
 }
 
+static bool peerMacEquals(const char* a, const char* b) {
+    if (!a || !b) return false;
+    if (strcmp(a, "bc") == 0 || strcmp(b, "bc") == 0)
+        return strcmp(a, "bc") == 0 && strcmp(b, "bc") == 0;
+    // compare ignoring separators / case
+    char na[13] = {0}, nb[13] = {0};
+    int ia = 0, ib = 0;
+    for (int i = 0; a[i] && ia < 12; i++) {
+        char c = a[i];
+        if (c >= 'a' && c <= 'f') c -= 32;
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) na[ia++] = c;
+    }
+    for (int i = 0; b[i] && ib < 12; i++) {
+        char c = b[i];
+        if (c >= 'a' && c <= 'f') c -= 32;
+        if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F')) nb[ib++] = c;
+    }
+    return ia == 12 && ib == 12 && memcmp(na, nb, 12) == 0;
+}
+
+void inboxRebuildFrom(InboxEntry* tmp, int n) {
+    memset(inbox, 0, sizeof(inbox));
+    inboxCount = 0;
+    inboxNext = 0;
+    unreadCount = 0;
+    for (int i = 0; i < n; i++) {
+        inbox[inboxNext % MAX_INBOX] = tmp[i];
+        if (!tmp[i].isRead && !tmp[i].isSent) unreadCount++;
+        inboxNext++;
+        if (inboxCount < MAX_INBOX) inboxCount++;
+    }
+}
+
+bool inboxDeleteById(uint32_t id) {
+    if (inboxCount <= 0) return false;
+    static InboxEntry tmp[MAX_INBOX];
+    int n = 0;
+    bool found = false;
+    for (int i = 0; i < inboxCount; i++) {
+        int idx = (inboxNext - inboxCount + i + MAX_INBOX) % MAX_INBOX;
+        if (inbox[idx].msgId == id) { found = true; continue; }
+        tmp[n++] = inbox[idx];
+    }
+    if (!found) return false;
+    inboxRebuildFrom(tmp, n);
+    return true;
+}
+
+int inboxClearPeer(const char* peer) {
+    if (inboxCount <= 0) return 0;
+    static InboxEntry tmp[MAX_INBOX];
+    int n = 0, removed = 0;
+    for (int i = 0; i < inboxCount; i++) {
+        int idx = (inboxNext - inboxCount + i + MAX_INBOX) % MAX_INBOX;
+        if (peerMacEquals(inbox[idx].peerMac, peer)) { removed++; continue; }
+        tmp[n++] = inbox[idx];
+    }
+    if (removed) inboxRebuildFrom(tmp, n);
+    return removed;
+}
+
 String inboxToJson() {
     String json = "[";
     bool first = true;
@@ -479,8 +558,10 @@ String inboxToJson() {
         first = false;
         uint32_t nowI = millis() / 1000UL;
         uint32_t ageI = (nowI >= e.timestamp) ? (nowI - e.timestamp) : 0;
-        json += "{\"from\":\"" + escJson(String(e.fromName)) + "\","
+        json += "{\"id\":" + String(e.msgId) + ","
+             +  "\"from\":\"" + escJson(String(e.fromName)) + "\","
              +  "\"mac\":\""  + String(e.fromMac) + "\","
+             +  "\"peer\":\"" + String(e.peerMac) + "\","
              +  "\"text\":\"" + escJson(String(e.text)) + "\","
              +  "\"age\":"     + String(ageI) + ","
              +  "\"read\":"   + String(e.isRead ? "true" : "false") + ","
@@ -702,6 +783,13 @@ bool espNowSend(const uint8_t* toMac, const String& text) {
         InboxEntry& se = inbox[inboxNext % MAX_INBOX];
         strncpy(se.fromName, deviceName.c_str(), 31); se.fromName[31] = 0;
         strncpy(se.fromMac, getMacFmt().c_str(), 17); se.fromMac[17] = 0;
+        if (isBroadcastMac(toMac)) {
+            strncpy(se.peerMac, "bc", 17);
+        } else {
+            char peerMs[18]; macBytesToStr(toMac, peerMs);
+            strncpy(se.peerMac, peerMs, 17);
+        }
+        se.peerMac[17] = 0;
         strncpy(se.text, text.c_str(), 199); se.text[199] = 0;
         se.timestamp   = millis() / 1000UL;
         se.msgId       = pkt.msgId;
@@ -1100,6 +1188,7 @@ void ssePush(const char* event, const String& data) {
 
 // SSE-Verbindung aufbauen
 void handleSse() {
+    if (!requireAuth()) return;
     // Freien Slot suchen
     int slot = -1;
     for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
@@ -1149,355 +1238,642 @@ String handleApiStatusJson() {
     json += "\"bssid\":\"" + lockedBssid + "\",";
     json += "\"hubHost\":\"" + escJson(hubHost) + "\",";
     json += "\"hubPort\":" + String(hubPort) + ",";
-    json += "\"version\":\"" + String(FW_VERSION) + "\"";
+    json += "\"version\":\"" + String(FW_VERSION) + "\",";
+    json += "\"pinEnabled\":" + String(pinEnabled() ? "true" : "false");
     json += "}";
     return json;
 }
 
-void handleRoot() {
-    // Peer-Dropdown Optionen vorab bauen (C++ Seite)
-    String peerOptions = "<option value='bc'>\xF0\x9F\x93\xA2 An alle (Broadcast)</option>";
-    for (int i = 0; i < peerCount; i++) {
-        char ms[18]; macBytesToStr(knownPeers[i].mac, ms);
-        peerOptions += "<option value='" + String(ms) + "'>"
-                     + escHtml(String(knownPeers[i].name))
-                     + " (" + String(ms).substring(12) + ")</option>";
+
+// ================================================================
+//  PIN / Session Auth
+// ================================================================
+
+String hashPin(const String& pin) {
+    // FNV-1a 32-bit mit Salt (ausreichend fuer lokales Geraete-PIN)
+    uint32_t h = 2166136261u;
+    const char* salt = "espcomm-pin-v1";
+    for (const char* p = salt; *p; ++p) { h ^= (uint8_t)(*p); h *= 16777619u; }
+    for (size_t i = 0; i < pin.length(); i++) { h ^= (uint8_t)pin[i]; h *= 16777619u; }
+    char buf[9];
+    snprintf(buf, sizeof(buf), "%08X", (unsigned)h);
+    return String(buf);
+}
+
+bool pinEnabled() {
+    return pinHashStored.length() == 8;
+}
+
+void loadPinFromPrefs() {
+    prefs.begin("espcomm", true);
+    pinHashStored = prefs.getString("pinhash", "");
+    prefs.end();
+}
+
+void savePinHash(const String& hash) {
+    pinHashStored = hash;
+    prefs.begin("espcomm", false);
+    if (hash.length()) prefs.putString("pinhash", hash);
+    else prefs.remove("pinhash");
+    prefs.end();
+}
+
+String makeSessionToken() {
+    char tok[17];
+    for (int i = 0; i < 16; i++) {
+        uint8_t v = (uint8_t)(esp_random() & 0xF);
+        tok[i] = "0123456789ABCDEF"[v];
+    }
+    tok[16] = 0;
+    return String(tok);
+}
+
+String createSession() {
+    // expire old
+    uint32_t now = millis();
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (webSessions[i].used && (now - webSessions[i].created) > SESSION_TTL_MS)
+            webSessions[i].used = false;
+    }
+    int slot = -1;
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!webSessions[i].used) { slot = i; break; }
+    }
+    if (slot < 0) slot = 0; // overwrite oldest slot 0
+    String tok = makeSessionToken();
+    strncpy(webSessions[slot].token, tok.c_str(), 16);
+    webSessions[slot].token[16] = 0;
+    webSessions[slot].created = now;
+    webSessions[slot].used = true;
+    return tok;
+}
+
+void destroySessionToken(const String& tok) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (webSessions[i].used && tok.equals(webSessions[i].token))
+            webSessions[i].used = false;
+    }
+}
+
+String getCookieValue(const String& name) {
+    if (!webServer.hasHeader("Cookie")) return "";
+    String c = webServer.header("Cookie");
+    String key = name + "=";
+    int p = c.indexOf(key);
+    if (p < 0) return "";
+    p += key.length();
+    int e = c.indexOf(';', p);
+    if (e < 0) e = c.length();
+    String v = c.substring(p, e);
+    v.trim();
+    return v;
+}
+
+bool sessionValid() {
+    if (!pinEnabled()) return true;
+    String tok = getCookieValue("comm_sess");
+    if (tok.length() != 16) return false;
+    uint32_t now = millis();
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (!webSessions[i].used) continue;
+        if ((now - webSessions[i].created) > SESSION_TTL_MS) {
+            webSessions[i].used = false;
+            continue;
+        }
+        if (tok.equals(webSessions[i].token)) return true;
+    }
+    return false;
+}
+
+bool requireAuth() {
+    if (!pinEnabled()) return true;
+    if (sessionValid()) return true;
+    webServer.send(401, "application/json",
+                   "{\"ok\":false,\"error\":\"login erforderlich\",\"auth\":true}");
+    return false;
+}
+
+void sendSessionCookie(const String& tok) {
+    // 24h
+    webServer.sendHeader("Set-Cookie",
+        "comm_sess=" + tok + "; Path=/; Max-Age=86400; SameSite=Lax", true);
+}
+
+void clearSessionCookie() {
+    webServer.sendHeader("Set-Cookie",
+        "comm_sess=; Path=/; Max-Age=0; SameSite=Lax", true);
+}
+
+void handleLoginPage() {
+    String html = R"rawhtml(<!DOCTYPE html>
+<html lang="de"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Anmelden · Communicator</title>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@500;700&family=Syne:wght@800&display=swap" rel="stylesheet">
+<style>
+body{margin:0;min-height:100vh;display:grid;place-items:center;font-family:Figtree,system-ui,sans-serif;
+background:radial-gradient(800px 400px at 20% 0%,rgba(26,155,135,.22),transparent 55%),linear-gradient(165deg,#eef6f2,#dceae4);color:#14221f}
+.card{width:min(380px,92vw);background:rgba(247,252,250,.9);border:1px solid #c9d8d2;border-radius:20px;padding:28px 22px;box-shadow:0 12px 30px rgba(20,34,31,.08)}
+h1{font-family:Syne,system-ui,sans-serif;font-size:1.4rem;margin:0 0 6px;letter-spacing:-.02em}
+p{color:#5c716b;font-size:14px;margin:0 0 18px}
+input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid #c9d8d2;font:inherit;margin-bottom:12px;box-sizing:border-box}
+button{width:100%;padding:12px;border:none;border-radius:12px;font-weight:700;font:inherit;color:#fff;
+background:linear-gradient(135deg,#0d6b63,#1a9b87);cursor:pointer}
+.err{color:#b42318;font-size:13px;min-height:18px;margin-bottom:8px}
+</style></head><body>
+<div class="card">
+  <h1>)rawhtml";
+    html += escHtml(deviceName);
+    html += R"rawhtml(</h1>
+  <p>Geraete-PIN eingeben, um Chat und Anrufe zu oeffnen.</p>
+  <div class="err" id="err"></div>
+  <input id="pin" type="password" inputmode="numeric" maxlength="8" placeholder="PIN" autofocus
+    onkeydown="if(event.key==='Enter')login()">
+  <button onclick="login()">Anmelden</button>
+</div>
+<script>
+function login(){
+  var pin=document.getElementById('pin').value;
+  var err=document.getElementById('err');
+  err.textContent='';
+  fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({pin:pin}),credentials:'same-origin'})
+  .then(function(r){return r.json().then(function(d){return {ok:r.ok,d:d};});})
+  .then(function(x){
+    if(x.ok&&x.d.ok) location.href='/';
+    else err.textContent=(x.d&&x.d.error)||'Falsche PIN';
+  }).catch(function(){err.textContent='Verbindungsfehler';});
+}
+</script>
+</body></html>
+)rawhtml";
+    webServer.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleApiAuthStatus() {
+    bool logged = sessionValid();
+    String j = "{";
+    j += "\"ok\":true,";
+    j += "\"pinEnabled\":"; j += pinEnabled() ? "true" : "false"; j += ",";
+    j += "\"loggedIn\":"; j += logged ? "true" : "false";
+    j += "}";
+    webServer.send(200, "application/json", j);
+}
+
+void handleApiLogin() {
+    if (!pinEnabled()) {
+        webServer.send(200, "application/json", "{\"ok\":true,\"pinEnabled\":false}");
+        return;
+    }
+    if (!webServer.hasArg("plain")) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(128);
+#endif
+    if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+    String pin = doc["pin"].as<String>();
+    pin.trim();
+    if (hashPin(pin) != pinHashStored) {
+        delay(300);
+        webServer.send(401, "application/json", "{\"ok\":false,\"error\":\"Falsche PIN\"}");
+        return;
+    }
+    String tok = createSession();
+    sendSessionCookie(tok);
+    webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiLogout() {
+    String tok = getCookieValue("comm_sess");
+    if (tok.length()) destroySessionToken(tok);
+    clearSessionCookie();
+    webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiSetPin() {
+    if (!requireAuth()) return;
+    if (!webServer.hasArg("plain")) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(192);
+#endif
+    if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+    String action = doc["action"].as<String>(); // set | clear | change
+    String pin = doc["pin"].as<String>();
+    String oldPin = doc["oldPin"].as<String>();
+    pin.trim(); oldPin.trim();
+
+    if (action == "clear") {
+        if (!pinEnabled()) { webServer.send(200, "application/json", "{\"ok\":true}"); return; }
+        if (hashPin(oldPin) != pinHashStored) {
+            webServer.send(401, "application/json", "{\"ok\":false,\"error\":\"Aktuelle PIN falsch\"}");
+            return;
+        }
+        savePinHash("");
+        // alle Sessions invalidieren
+        for (int i = 0; i < MAX_SESSIONS; i++) webSessions[i].used = false;
+        clearSessionCookie();
+        logEvent("PIN entfernt");
+        webServer.send(200, "application/json", "{\"ok\":true,\"pinEnabled\":false}");
+        return;
     }
 
-    // BSSID-Lock Button
+    // set or change
+    if (pin.length() < 4 || pin.length() > 8) {
+        webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"PIN 4-8 Zeichen\"}");
+        return;
+    }
+    for (size_t i = 0; i < pin.length(); i++) {
+        if (pin[i] < '0' || pin[i] > '9') {
+            webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Nur Ziffern\"}");
+            return;
+        }
+    }
+    if (pinEnabled()) {
+        if (hashPin(oldPin) != pinHashStored) {
+            webServer.send(401, "application/json", "{\"ok\":false,\"error\":\"Aktuelle PIN falsch\"}");
+            return;
+        }
+    }
+    savePinHash(hashPin(pin));
+    String tok = createSession();
+    sendSessionCookie(tok);
+    logEvent("PIN gesetzt/geaendert");
+    webServer.send(200, "application/json", "{\"ok\":true,\"pinEnabled\":true}");
+}
+
+void handleRoot() {
+    if (pinEnabled() && !sessionValid()) { handleLoginPage(); return; }
     String bssidSection;
     if (lockedBssid.length() == 12) {
-        bssidSection = "<span style='color:#3fb950;font-family:monospace'>" + lockedBssid + "</span>"
-                       " <button class='btn-sm' onclick='clearBssid()'>&#128275; Aufheben</button>";
+        bssidSection = "<span class='mono ok'>" + lockedBssid + "</span>"
+                       " <button class='btn ghost' onclick='clearBssid()'>Aufheben</button>";
     } else {
-        bssidSection = "<span style='color:#8b949e'>nicht gesetzt</span>"
-                       " <button class='btn-sm' onclick='lockBssid()'>&#128274; AP sperren</button>";
+        bssidSection = "<span class='muted'>nicht gesetzt</span>"
+                       " <button class='btn ghost' onclick='lockBssid()'>AP sperren</button>";
     }
-
-    // Kanal ermitteln
     uint8_t chD; wifi_second_chan_t scD;
     esp_wifi_get_channel(&chD, &scD);
 
     webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
     webServer.send(200, "text/html; charset=utf-8", "");
 
-    // ── Chunk 1: HEAD + CSS ──────────────────────────────────────
     webServer.sendContent(R"rawhtml(<!DOCTYPE html>
-<html lang="de">
-<head>
+<html lang="de"><head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP Communicator</title>
-<script src="https://cdn.rawgit.com/Mikhus/canvas-gauges/gh-pages/download/2.1.7/all/gauge.min.js"></script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0a4f4a">
+<title>Communicator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600;700&family=Syne:wght@700;800&display=swap" rel="stylesheet">
 <style>
+:root{
+  --ink:#14221f;--muted:#5c716b;--line:#c9d8d2;--bg0:#dceae4;--bg1:#eef6f2;
+  --panel:#f7fcfa;--teal:#0d6b63;--sea:#1a9b87;--deep:#0a4f4a;
+  --danger:#b42318;--ok:#1a7a4c;--warn:#a65d1a;--bubble:#dff3ee;
+  --shadow:0 10px 30px rgba(20,34,31,.08);
+  --font:"Figtree",system-ui,sans-serif;--display:"Syne",system-ui,sans-serif;
+}
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#0d1117;color:#e6edf3;font-family:system-ui,sans-serif;font-size:14px}
-header{background:#161b22;border-bottom:1px solid #30363d;padding:12px 20px;
-  display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-h1{font-size:17px;color:#58a6ff;display:flex;align-items:center;gap:8px}
-.badge{padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;white-space:nowrap}
-.bc-blue{background:rgba(88,166,255,.15);color:#58a6ff;border:1px solid rgba(88,166,255,.3)}
-.bc-green{background:rgba(63,185,80,.15);color:#3fb950;border:1px solid rgba(63,185,80,.3)}
-.bc-red{background:rgba(248,81,73,.15);color:#f85149;border:1px solid rgba(248,81,73,.3)}
-.bc-purple{background:rgba(188,140,255,.15);color:#bc8cff;border:1px solid rgba(188,140,255,.3)}
-.bc-yellow{background:rgba(227,179,65,.15);color:#e3b341;border:1px solid rgba(227,179,65,.3)}
-.tabs{display:flex;background:#161b22;border-bottom:1px solid #30363d;overflow-x:auto;gap:0}
-.tab{padding:10px 18px;cursor:pointer;border-bottom:3px solid transparent;
-  color:#8b949e;font-weight:500;white-space:nowrap;user-select:none;transition:color .15s}
-.tab.active,.tab:hover{color:#58a6ff;border-bottom-color:#58a6ff}
-.pane{display:none;padding:16px;max-width:900px;margin:0 auto}
-.pane.active{display:block}
-.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin-bottom:12px}
-.card h3{font-size:11px;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}
-input,textarea,select{background:#0d1117;border:1px solid #30363d;color:#e6edf3;
-  border-radius:6px;padding:8px 10px;font-size:13px;width:100%;outline:none}
-input:focus,textarea:focus,select:focus{border-color:#58a6ff}
-textarea{resize:vertical;min-height:70px;font-family:inherit}
-.btn-send{background:#238636;color:#fff;border:none;padding:10px;border-radius:6px;
-  cursor:pointer;font-size:14px;font-weight:600;width:100%;margin-top:8px}
-.btn-send:hover{background:#2ea043}
-.btn-sm{background:#21262d;color:#8b949e;border:1px solid #30363d;
-  padding:4px 10px;font-size:12px;border-radius:6px;cursor:pointer}
-.btn-sm:hover{border-color:#58a6ff;color:#58a6ff}
-.btn-danger{background:#6e1b1b;color:#f85149;border:1px solid #f85149;
-  padding:4px 10px;font-size:12px;border-radius:6px;cursor:pointer}
-.chat-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-.emoji-bar{display:flex;gap:4px;flex-wrap:wrap;padding:6px 0;border-bottom:1px solid #21262d;margin-bottom:8px}
-.emoji-btn{cursor:pointer;padding:2px 5px;border-radius:4px;background:none;
-  border:none;font-size:18px;line-height:1}
-.emoji-btn:hover{background:#21262d}
-.msg-list{display:flex;flex-direction:column;gap:6px}
-.msg{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:10px 12px}
-.msg.unread{border-left:3px solid #58a6ff}
-.msg.sent{background:#0d2016;border-left:3px solid #3fb950}
-.msg-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;flex-wrap:wrap;gap:4px}
-.msg-from{font-weight:600;font-size:13px}
-.msg-from.me{color:#3fb950}
-.msg-meta{font-size:11px;color:#8b949e;display:flex;gap:6px;align-items:center}
-.msg-text{color:#c9d1d9;font-size:13px;line-height:1.5;word-break:break-word}
-.peer-card{background:#0d1117;border:1px solid #21262d;border-radius:8px;
-  padding:10px 12px;display:flex;align-items:center;gap:10px;cursor:pointer;margin-bottom:6px}
-.peer-card:hover{border-color:#30363d}
-.peer-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0}
-.peer-name{font-weight:600;font-size:13px}
-.peer-mac{font-size:11px;color:#8b949e;font-family:monospace}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px;margin-bottom:14px}
-.stat-box{background:#0d1117;border:1px solid #21262d;border-radius:8px;padding:12px;text-align:center}
-.stat-val{font-size:26px;font-weight:700;color:#58a6ff;line-height:1}
-.stat-lbl{font-size:11px;color:#8b949e;margin-top:4px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td{padding:7px 8px;border-bottom:1px solid #21262d}
-td:first-child{color:#8b949e;width:42%}
-.gauge-row{display:flex;justify-content:center;gap:24px;flex-wrap:wrap;padding:8px 0}
-.gauge-box{text-align:center}
-.gauge-lbl{font-size:12px;color:#8b949e;margin-top:4px}
-.log-entry{display:flex;justify-content:space-between;padding:7px 8px;
-  border-bottom:1px solid #21262d;font-size:13px;gap:8px}
-.log-msg{color:#c9d1d9;flex:1}
-.log-age{color:#8b949e;flex-shrink:0;font-size:11px}
-.empty{color:#8b949e;text-align:center;padding:24px;font-size:13px}
-.warn{background:rgba(227,179,65,.08);border:1px solid rgba(227,179,65,.25);
-  border-radius:6px;padding:8px 12px;color:#e3b341;font-size:12px;margin-bottom:8px}
-#toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-  background:#238636;color:#fff;padding:8px 20px;border-radius:20px;
-  font-size:13px;opacity:0;transition:opacity .3s;pointer-events:none;z-index:99}
-#toast.show{opacity:1}
-.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.75);
-  z-index:100;align-items:center;justify-content:center}
-.modal-overlay.show{display:flex}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;
-  padding:28px;text-align:center;max-width:320px;width:90%;
-  box-shadow:0 8px 32px rgba(0,0,0,.5)}
-.modal h2{font-size:18px;margin-bottom:6px;color:#e6edf3}
-.modal p{color:#8b949e;font-size:13px;margin-bottom:20px}
-.call-avatar{font-size:52px;margin-bottom:12px;animation:pulse 1s infinite}
-@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.08)}}
-.call-btns{display:flex;gap:12px;justify-content:center}
-.btn-call{background:#238636;color:#fff;border:none;padding:12px 24px;
-  border-radius:24px;cursor:pointer;font-size:15px;font-weight:600}
-.btn-call:hover{background:#2ea043}
-.btn-hangup{background:#b91c1c;color:#fff;border:none;padding:12px 24px;
-  border-radius:24px;cursor:pointer;font-size:15px;font-weight:600}
-.btn-hangup:hover{background:#dc2626}
-.btn-call-sm{background:#1a3a2a;color:#3fb950;border:1px solid #3fb950;
-  padding:5px 12px;border-radius:16px;cursor:pointer;font-size:12px;
-  font-weight:600;display:inline-flex;align-items:center;gap:4px}
-.btn-call-sm:hover{background:#238636;color:#fff}
-.rtc-media{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}
-.rtc-media video{background:#0d1117;border:1px solid #30363d;border-radius:8px;
-  width:140px;height:105px;object-fit:cover}
-.rtc-media video#rtc-local{transform:scaleX(-1)}
-.rtc-hint{font-size:11px;color:#8b949e;margin-top:8px}
+html,body{height:100%;}
+body{
+  color:var(--ink);font:15px/1.45 var(--font);
+  background:
+    radial-gradient(900px 420px at 0% 0%,rgba(26,155,135,.2),transparent 55%),
+    radial-gradient(700px 380px at 100% 0%,rgba(13,107,99,.14),transparent 50%),
+    linear-gradient(165deg,var(--bg1),var(--bg0));
+}
+button,input,textarea{font:inherit}
+button{cursor:pointer}
+.mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+.muted{color:var(--muted)} .ok{color:var(--ok)}
+.app{
+  max-width:1100px;margin:0 auto;height:100%;min-height:100dvh;
+  display:grid;grid-template-columns:1fr;position:relative;
+}
+@media(min-width:860px){
+  body{padding:18px}
+  .app{
+    height:calc(100dvh - 36px);min-height:560px;border-radius:22px;overflow:hidden;
+    border:1px solid rgba(201,216,210,.9);box-shadow:var(--shadow);
+    grid-template-columns:340px 1fr;background:rgba(247,252,250,.72);backdrop-filter:blur(14px);
+  }
+}
+.pane{display:none;flex-direction:column;min-height:0;height:100%;background:rgba(247,252,250,.82)}
+.pane.show{display:flex}
+@media(min-width:860px){
+  #view-list{display:flex !important;border-right:1px solid var(--line)}
+  #view-chat{display:flex !important}
+  #view-more.overlay{position:absolute;inset:0;z-index:20;background:rgba(12,28,26,.35);padding:24px;align-items:center;justify-content:center}
+  #view-more.overlay .sheet{width:min(520px,100%);max-height:90%;overflow:auto;border-radius:18px;background:var(--panel);border:1px solid var(--line);box-shadow:var(--shadow)}
+}
+.top{
+  display:flex;align-items:center;gap:12px;padding:14px 16px;border-bottom:1px solid var(--line);
+  background:rgba(255,255,255,.55);backdrop-filter:blur(10px);flex-shrink:0;
+}
+.logo{
+  width:40px;height:40px;border-radius:12px;flex-shrink:0;position:relative;
+  background:conic-gradient(from 200deg,var(--teal),var(--sea),#7ed7c6,var(--teal));
+  animation:spin 16s linear infinite;
+}
+.logo:after{content:"";position:absolute;inset:6px;border-radius:8px;background:var(--panel)}
+.logo i{position:absolute;inset:0;margin:auto;width:8px;height:8px;border-radius:50%;background:var(--teal);z-index:1;animation:pulse 2.2s ease-in-out infinite}
+.brand .k{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);font-weight:700}
+.brand h1{font:800 1.15rem/1.1 var(--display);letter-spacing:-.03em}
+.icon-btn{
+  width:40px;height:40px;border-radius:12px;border:1px solid var(--line);background:#fff;
+  color:var(--ink);display:grid;place-items:center;font-size:18px;flex-shrink:0;
+}
+.icon-btn:hover{border-color:var(--teal);color:var(--teal)}
+.search{
+  margin:12px 14px 6px;padding:10px 12px;border-radius:12px;border:1px solid var(--line);
+  background:#fff;width:calc(100% - 28px);
+}
+.clist{flex:1;overflow:auto;padding:6px 10px 18px}
+.crow{
+  display:flex;gap:12px;align-items:center;padding:12px;border-radius:14px;cursor:pointer;
+  border:1px solid transparent;transition:background .15s,border-color .15s,transform .15s;
+  background:rgba(255,255,255,.35);
+}
+.crow:hover{background:#fff;border-color:var(--line);transform:translateY(-1px)}
+.crow.active{background:#fff;border-color:var(--teal);box-shadow:0 0 0 2px rgba(13,107,99,.12)}
+.crow.offline{opacity:.72}
+.av{
+  width:48px;height:48px;border-radius:16px;flex-shrink:0;display:grid;place-items:center;
+  font:800 15px/1 var(--display);color:#fff;background:linear-gradient(135deg,var(--teal),var(--sea));
+  position:relative;box-shadow:0 4px 12px rgba(13,107,99,.18);
+}
+.av.bc{background:linear-gradient(135deg,#355c57,#6aa89c);box-shadow:none}
+.av .dot{
+  position:absolute;right:-2px;bottom:-2px;width:14px;height:14px;border-radius:50%;
+  border:2.5px solid #fff;background:#9aada6;
+}
+.av .dot.on{background:#12b886;box-shadow:0 0 0 4px rgba(18,184,134,.22);animation:pulse 2s ease-in-out infinite}
+.cmeta{flex:1;min-width:0}
+.cmeta .n{font-weight:700;font-size:15px;display:flex;justify-content:space-between;gap:8px;align-items:center}
+.cmeta .p{color:var(--muted);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:3px}
+.cmeta .subline{display:flex;gap:8px;align-items:center;margin-top:4px;flex-wrap:wrap}
+.st{
+  font-size:11px;font-weight:800;letter-spacing:.02em;text-transform:uppercase;
+  padding:3px 8px;border-radius:8px;border:1px solid transparent;
+}
+.st.on{color:#0b7a55;background:rgba(18,184,134,.14);border-color:rgba(18,184,134,.35)}
+.st.off{color:#6b7280;background:rgba(107,114,128,.1);border-color:rgba(107,114,128,.22)}
+.st.bc{color:var(--teal-deep);background:rgba(13,107,99,.1);border-color:rgba(13,107,99,.25)}
+.macs{font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--muted)}
+.pill{
+  min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--teal);color:#fff;
+  font-size:11px;font-weight:700;display:inline-grid;place-items:center;
+}
+.chat-head{gap:10px}
+.chat-head .who{flex:1;min-width:0}
+.chat-head .who .n{font:700 1rem/1.15 var(--display);letter-spacing:-.02em}
+.chat-head .who .s{font-size:12px;color:var(--muted)}
+.btn{
+  border:none;border-radius:12px;padding:10px 14px;font-weight:700;
+  background:linear-gradient(135deg,var(--teal),var(--sea));color:#fff;
+}
+.btn.ghost{background:#fff;color:var(--muted);border:1px solid var(--line)}
+.btn.ghost:hover{color:var(--teal);border-color:var(--teal)}
+.btn.danger{background:var(--danger)}
+.btn.call{padding:10px 16px}
+.thread{
+  flex:1;overflow:auto;padding:16px 14px 10px;display:flex;flex-direction:column;gap:8px;
+  background:
+    linear-gradient(180deg,rgba(255,255,255,.15),transparent 40%),
+    repeating-linear-gradient(0deg,transparent,transparent 27px,rgba(20,34,31,.03) 28px);
+}
+.day{align-self:center;font-size:11px;font-weight:700;color:var(--muted);background:rgba(255,255,255,.7);
+  border:1px solid var(--line);padding:4px 10px;border-radius:999px;margin:6px 0}
+.bubble{
+  max-width:min(78%,420px);padding:10px 12px;border-radius:16px;font-size:14px;line-height:1.45;
+  word-break:break-word;animation:rise .28s ease;border:1px solid transparent;
+}
+.bubble.in{align-self:flex-start;background:#fff;border-color:var(--line);border-bottom-left-radius:6px}
+.bubble.out{align-self:flex-end;background:var(--bubble);border-color:#bfe6dc;border-bottom-right-radius:6px}
+.bubble .meta{display:flex;gap:8px;align-items:center;margin-top:5px;font-size:11px;color:var(--muted)}
+.bubble .fn{font-weight:700;font-size:12px;color:var(--teal);margin-bottom:2px}
+.bubble .del{
+  margin-left:auto;border:none;background:transparent;color:var(--muted);cursor:pointer;
+  font-size:12px;font-weight:700;padding:2px 6px;border-radius:6px;
+}
+.bubble .del:hover{color:var(--danger);background:rgba(180,35,24,.08)}
+.chat-actions{display:flex;gap:6px;align-items:center;flex-shrink:0}
+.empty{
+  margin:auto;text-align:center;color:var(--muted);padding:28px 18px;max-width:320px;
+}
+.empty strong{display:block;font:700 1.15rem/1.2 var(--display);color:var(--ink);margin-bottom:8px}
+.composer{
+  display:flex;flex-direction:column;gap:8px;padding:12px;border-top:1px solid var(--line);background:rgba(255,255,255,.7);
+  backdrop-filter:blur(10px);flex-shrink:0;
+}
+.composer-row{display:flex;gap:8px;align-items:flex-end}
+.composer textarea{
+  flex:1;resize:none;min-height:44px;max-height:120px;padding:11px 12px;border-radius:14px;
+  border:1px solid var(--line);background:#fff;outline:none;
+}
+.composer textarea:focus{border-color:var(--teal);box-shadow:0 0 0 3px rgba(13,107,99,.12)}
+.composer .send{width:48px;height:48px;border-radius:14px;flex-shrink:0}
+.emoji-bar{display:flex;gap:4px;flex-wrap:wrap;max-height:0;overflow:hidden;opacity:0;transition:max-height .2s,opacity .2s}
+.emoji-bar.open{max-height:120px;opacity:1}
+.emoji-btn{border:1px solid transparent;background:transparent;border-radius:8px;padding:4px 6px;font-size:18px;line-height:1;cursor:pointer}
+.emoji-btn:hover{background:#fff;border-color:var(--line)}
+.pin-box{background:#fff;border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin-bottom:12px}
+.pin-box h3{font-size:13px;margin:0 0 8px}
+.pin-box .hint{font-size:12px;color:var(--muted);margin-bottom:10px}
+.pin-box input{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--line);margin-bottom:8px;box-sizing:border-box}
+.sheet{padding:18px}
+.sheet h2{font:800 1.2rem/1.1 var(--display);margin-bottom:4px}
+.sheet .sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+.statgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px}
+.stat{background:#fff;border:1px solid var(--line);border-radius:12px;padding:12px;text-align:center}
+.stat b{display:block;font:800 1.25rem/1 var(--display);color:var(--teal)}
+.stat span{font-size:11px;color:var(--muted);font-weight:700;text-transform:uppercase;letter-spacing:.04em}
+.rows{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:12px}
+.row{display:flex;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line);font-size:13px}
+.row:last-child{border-bottom:0}
+.row span:first-child{color:var(--muted);font-weight:600}
 .name-form{display:flex;gap:8px;margin-top:8px}
-.name-form input{flex:1;padding:6px 10px;font-size:13px}
-.name-form button{background:#238636;color:#fff;border:none;
-  padding:6px 14px;border-radius:6px;cursor:pointer;white-space:nowrap}
-</style>
-</head>
-<body>
+.name-form input{flex:1;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:#fff}
+.logbox{max-height:180px;overflow:auto;font-size:12px}
+.logline{display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-bottom:1px solid var(--line)}
+#toast{
+  position:fixed;left:50%;bottom:22px;transform:translateX(-50%) translateY(8px);
+  background:var(--deep);color:#fff;padding:10px 16px;border-radius:12px;font-weight:600;font-size:13px;
+  opacity:0;transition:.25s;z-index:50;pointer-events:none;
+}
+#toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(12,28,26,.55);z-index:60;
+  align-items:center;justify-content:center;padding:16px;backdrop-filter:blur(6px)}
+.modal-overlay.show{display:flex}
+.modal{background:#fff;border:1px solid var(--line);border-radius:20px;padding:24px;width:min(420px,100%);text-align:center;animation:rise .28s ease}
+.modal h2{font:800 1.2rem/1.15 var(--display);margin-bottom:6px}
+.modal p{color:var(--muted);margin-bottom:16px}
+.call-av{width:64px;height:64px;margin:0 auto 12px;border-radius:18px;display:grid;place-items:center;
+  color:#fff;font-size:28px;background:linear-gradient(135deg,var(--teal),var(--sea));animation:pulse 1.4s ease-in-out infinite}
+.call-btns{display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.rtc-media{display:flex;gap:8px;justify-content:center;margin:12px 0;flex-wrap:wrap}
+.rtc-media video{width:148px;height:111px;object-fit:cover;border-radius:12px;background:#14221f;border:1px solid var(--line)}
+#rtc-local{transform:scaleX(-1)}
+.rtc-hint{font-size:11px;color:var(--muted);margin-top:8px}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(max-width:859px){
+  #view-chat.show,#view-list.show,#view-more.show{position:fixed;inset:0;z-index:5}
+  #view-more .sheet{height:100%;overflow:auto;background:var(--panel)}
+}
+</style></head><body>
+<div class="app" id="app">
 )rawhtml");
 
-    // ── Chunk 2: Header + Tabs (mit dynamischen Werten) ──────────
-    String h2;
-    h2.reserve(1200);
-    h2 = "<header><h1>&#128172; ";
-    h2 += escHtml(deviceName);
-    h2 += "</h1><span class='badge bc-blue'>v";
-    h2 += FW_VERSION;
-    h2 += "</span>";
-    h2 += espNowReady ?
-          "<span class='badge bc-green'>ESP-NOW &#9679;</span>" :
-          "<span class='badge bc-red'>ESP-NOW &#9679;</span>";
-    if (unreadCount > 0) {
-        h2 += "<span class='badge bc-yellow' id='ubadge'>&#9993; ";
-        h2 += String(unreadCount);
-        h2 += " neu</span>";
+    // Dynamic list header
+    {
+        String h;
+        h.reserve(500);
+        h = "<section class='pane show' id='view-list'>"
+            "<div class='top'><div class='logo' aria-hidden='true'><i></i></div>"
+            "<div class='brand'><div class='k'>ESP Mesh Link</div><h1>";
+        h += escHtml(deviceName);
+        h += "</h1></div>"
+             "<button class='icon-btn' title='Mehr' onclick='showMore()' aria-label='Mehr'>&#8943;</button>"
+             "</div>"
+             "<input class='search' id='q' placeholder='Kontakt suchen...' oninput='renderList()'>"
+             "<div class='clist' id='clist'></div></section>";
+        webServer.sendContent(h);
     }
-    h2 += "</header>\n";
-    h2 += "<div class='tabs'>"
-          "<div class='tab active' onclick='showTab(\"chat\",this)'>&#128172; Chat</div>"
-          "<div class='tab' onclick='showTab(\"devs\",this)'>&#128241; Ger&auml;te</div>"
-          "<div class='tab' onclick='showTab(\"stat\",this)'>&#128202; Status</div>"
-          "<div class='tab' onclick='showTab(\"log\",this)'>&#128221; Log</div>"
-          "<a class='tab' href='/ota'>&#128640; OTA</a>"
-          "</div>\n";
-    webServer.sendContent(h2);
 
-    // ── Chunk 3: Chat-Pane ───────────────────────────────────────
-    String h3;
-    h3.reserve(1500);
-    h3 = "<div id='pane-chat' class='pane active'>"
-         "<div class='card'>"
-         "<select id='sel-to' style='margin-bottom:8px'>";
-    h3 += peerOptions;
-    h3 += "</select>"
-           "<div class='name-form'>"
-           "<input id='my-name-input' placeholder='Mein Name' maxlength='31' value='";
-    h3 += escHtml(deviceName);
-    h3 += "'";
-    h3 +=           "'>"
-           "<button onclick='setMyName()'>&#128336; Speichern</button>"
-           "</div>"
-          "<div class='emoji-bar'>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128512;\")' title='Smile'>&#128512;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128077;\")' title='Daumen hoch'>&#128077;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128078;\")' title='Daumen runter'>&#128078;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128293;\")' title='Feuer'>&#128293;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#10084;\")' title='Herz'>&#10084;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128075;\")' title='Winken'>&#128075;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128514;\")' title='Lachen'>&#128514;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128532;\")' title='Hm'>&#128532;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#9989;\")' title='Check'>&#9989;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#10060;\")' title='X'>&#10060;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#128276;\")' title='Glocke'>&#128276;</button>"
-          "<button class='emoji-btn' onclick='addEmoji(\"&#127881;\")' title='Party'>&#127881;</button>"
-          "</div>"
-          "<textarea id='msg-text' placeholder='Nachricht...' maxlength='199' rows='2'></textarea>"
-          "<button class='btn-send' onclick='sendMsg()'>&#9658; Senden</button>"
-          "</div>"
-          "<div class='card'>"
-          "<div class='chat-header'>"
-          "<h3 style='margin:0'>&#128172; Chat (<span id='ucnt'>";
-    h3 += String(unreadCount);
-    h3 += "</span> ungelesen)</h3>"
-          "<div style='display:flex;gap:6px'>"
-          "<button class='btn-sm' onclick='markRead()'>&#10003; Gelesen</button>"
-          "<button class='btn-danger' onclick='clearChat()'>&#128465; Leeren</button>"
-          "</div></div>"
-          "<div class='msg-list' id='msg-list'>"
-          "<div class='empty'>&#8987; Lade...</div>"
-          "</div></div></div>\n";
-    webServer.sendContent(h3);
+    webServer.sendContent(R"rawhtml(
+<section class="pane" id="view-chat">
+  <div class="top chat-head">
+    <button class="icon-btn back" onclick="showList()" aria-label="Zurueck">&#8592;</button>
+    <div class="who"><div class="n" id="chat-name">Chat</div><div class="s" id="chat-sub"> </div></div>
+    <div class="chat-actions">
+      <button class="btn ghost" id="btn-clear" title="Chat leeren" onclick="clearThread()">Leeren</button>
+      <button class="btn call" id="btn-call" onclick="callCurrent()">Anruf</button>
+    </div>
+  </div>
+  <div class="thread" id="thread"></div>
+  <div class="composer">
+    <div class="emoji-bar" id="emoji-bar">
+      <button type="button" class="emoji-btn" onclick="addEmoji('😀')">😀</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('😂')">😂</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('😍')">😍</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('👍')">👍</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('👎')">👎</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('❤️')">❤️</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('🔥')">🔥</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('🎉')">🎉</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('👋')">👋</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('🙏')">🙏</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('✅')">✅</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('❌')">❌</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('⭐')">⭐</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('💡')">💡</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('🏠')">🏠</button>
+      <button type="button" class="emoji-btn" onclick="addEmoji('☕')">☕</button>
+    </div>
+    <div class="composer-row">
+      <button class="btn ghost" type="button" onclick="toggleEmoji()" title="Emoji" style="width:48px;height:48px;padding:0;flex-shrink:0">☺</button>
+      <textarea id="msg" rows="1" maxlength="199" placeholder="Nachricht..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendMsg();}"></textarea>
+      <button class="btn send" onclick="sendMsg()" aria-label="Senden">&#9654;</button>
+    </div>
+  </div>
+</section>
+<section class="pane" id="view-more">
+  <div class="sheet">
+    <div class="top" style="padding:0 0 14px;border:0;background:transparent">
+      <button class="icon-btn" onclick="hideMore()" aria-label="Schliessen">&#10005;</button>
+      <div class="brand"><div class="k">Geraet</div><h2 style="font:800 1.15rem/1.1 var(--display)">Status &amp; Einstellungen</h2></div>
+    </div>
+)rawhtml");
 
-    // ── Chunk 4: Geräte-Pane ─────────────────────────────────────
-    String h4;
-    h4.reserve(1200);
-    h4 = "<div id='pane-devs' class='pane'>"
-         "<div class='card'>"
-         "<div class='chat-header'>"
-         "<h3 style='margin:0'>Bekannte Ger&auml;te (<span id='peer-cnt'>";
-    h4 += String(peerCount);
-    h4 += "</span>)</h3>"
-          "<button class='btn-sm' onclick='loadPeers()'>&#8635; Aktualisieren</button>"
-          "</div><br>"
-          "<div id='peer-list'>";
-    if (peerCount == 0) {
-        h4 += "<div class='empty'>Noch keine Ger&auml;te entdeckt</div>";
-    } else {
-        uint32_t nowP = millis() / 1000UL;
-        for (int i = 0; i < peerCount; i++) {
-            PeerEntry& p = knownPeers[i];
-            char ms[18]; macBytesToStr(p.mac, ms);
-            bool online = (nowP - p.lastSeen) < 150;
-            h4 += "<div class='peer-card' onclick='selectPeer(\"";
-            h4 += String(ms);
-            h4 += "\",\"";
-            h4 += escHtml(String(p.name));
-            h4 += "\")'><div class='peer-dot' style='background:";
-            h4 += online ? "#3fb950" : "#555";
-            h4 += "'></div><div style='flex:1'><div class='peer-name'>";
-            h4 += escHtml(String(p.name));
-            h4 += "</div><div class='peer-mac'>";
-            h4 += String(ms);
-            h4 += "</div></div><span class='badge ";
-            h4 += online ? "bc-green" : "bc-red";
-            h4 += "'>";
-            h4 += online ? "online" : "offline";
-            h4 += "</span>";
-            if (online) {
-                h4 += "<button class='btn-call-sm' onclick='event.stopPropagation();startCall(\"";
-                h4 += String(ms);
-                h4 += "\",\"";
-                h4 += escHtml(String(p.name));
-                h4 += "\")'>&#128222; Anruf</button>";
-            }
-            h4 += "</div>";
-        }
+    {
+        String s;
+        s.reserve(1200);
+        s = "<div class='statgrid'>"
+            "<div class='stat'><b id='s-peers'>";
+        s += String(peerCount);
+        s += "</b><span>Peers</span></div>"
+             "<div class='stat'><b id='s-unread'>";
+        s += String(unreadCount);
+        s += "</b><span>Ungelesen</span></div>"
+             "<div class='stat'><b id='s-ch'>";
+        s += String(chD);
+        s += "</b><span>Kanal</span></div></div>"
+             "<div class='rows'>"
+             "<div class='row'><span>Firmware</span><span>";
+        s += FW_VERSION;
+        s += "</span></div>"
+             "<div class='row'><span>IP</span><span class='mono' id='s-ip'>";
+        s += getLocalIp();
+        s += "</span></div>"
+             "<div class='row'><span>MAC</span><span class='mono'>";
+        s += getMacFmt();
+        s += "</span></div>"
+             "<div class='row'><span>RSSI</span><span id='s-rssi'>";
+        s += String(WiFi.RSSI());
+        s += " dBm</span></div>"
+             "<div class='row'><span>Uptime</span><span id='s-uptime'>";
+        s += fmtUptime(millis() / 1000UL);
+        s += "</span></div>"
+             "<div class='row'><span>ESP-NOW</span><span id='s-espnow'>";
+        s += espNowReady ? "<span class='ok'>Aktiv</span>" : "Offline";
+        s += "</span></div>"
+             "<div class='row'><span>Gesendet / Empfangen</span><span><span id='s-sent'>";
+        s += String(sentTotal);
+        s += "</span> / <span id='s-recv'>";
+        s += String(recvTotal);
+        s += "</span></span></div>"
+             "<div class='row'><span>BSSID-Lock</span><span>";
+        s += bssidSection;
+        s += "</span></div></div>"
+             "<div class='rows' style='padding:12px 14px'>"
+             "<div style='font-weight:700;margin-bottom:6px'>Anzeigename</div>"
+             "<div class='name-form'><input id='my-name' maxlength='31' value='";
+        s += escHtml(deviceName);
+        s += "'><button class='btn' onclick='setMyName()'>Speichern</button></div></div>"
+             "<div class='pin-box' id='pin-box'>"
+             "<h3>Geraete-PIN</h3>"
+             "<div class='hint' id='pin-hint'>Schuetzt die Web-UI. ESP-NOW bleibt geraeteweit.</div>"
+             "<input id='pin-old' type='password' inputmode='numeric' maxlength='8' placeholder='Aktuelle PIN' style='display:none'>"
+             "<input id='pin-new' type='password' inputmode='numeric' maxlength='8' placeholder='Neue PIN (4-8 Ziffern)'>"
+             "<div style='display:flex;gap:8px;flex-wrap:wrap'>"
+             "<button class='btn' onclick='savePin()'>PIN speichern</button>"
+             "<button class='btn ghost' id='pin-clear-btn' onclick='clearPin()' style='display:none'>PIN entfernen</button>"
+             "<button class='btn ghost' onclick='doLogout()'>Abmelden</button>"
+             "</div></div>"
+             "<div style='display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px'>"
+             "<button class='btn ghost' onclick='manualSync()'>Kanal-Sync</button>"
+             "<a class='btn ghost' href='/ota' style='text-decoration:none;display:inline-block'>OTA Update</a>"
+             "</div>"
+             "<div class='rows' style='padding:12px 14px'>"
+             "<div style='font-weight:700;margin-bottom:8px'>Ereignisse</div>"
+             "<div class='logbox' id='log-list'></div></div>"
+             "</div></section>";
+        webServer.sendContent(s);
     }
-    h4 += "</div></div></div>\n";
-    webServer.sendContent(h4);
 
-    // ── Chunk 5: Status-Pane mit canvas-gauges ───────────────────
-    String h5;
-    h5.reserve(1600);
-    h5 = "<div id='pane-stat' class='pane'>"
-         "<div class='stat-grid'>"
-         "<div class='stat-box'><div class='stat-val' id='s-ch'>";
-    h5 += String(chD);
-    h5 += "</div><div class='stat-lbl'>WiFi-Kanal</div></div>"
-          "<div class='stat-box'><div class='stat-val' id='s-peers'>";
-    h5 += String(peerCount);
-    h5 += "</div><div class='stat-lbl'>Bekannte ESPs</div></div>"
-          "<div class='stat-box'><div class='stat-val' id='s-recv'>";
-    h5 += String(recvTotal);
-    h5 += "</div><div class='stat-lbl'>Empfangen</div></div>"
-          "<div class='stat-box'><div class='stat-val' id='s-sent'>";
-    h5 += String(sentTotal);
-    h5 += "</div><div class='stat-lbl'>Gesendet</div></div>"
-          "<div class='stat-box'><div class='stat-val' id='s-unread'>";
-    h5 += String(unreadCount);
-    h5 += "</div><div class='stat-lbl'>Ungelesen</div></div>"
-          "</div>"
-          // canvas-gauges: RSSI + Heap
-          "<div class='card'>"
-          "<h3>Radio &amp; Speicher</h3>"
-          "<div class='gauge-row'>"
-          "<div class='gauge-box'><canvas id='g-rssi'></canvas><div class='gauge-lbl'>WLAN RSSI (dBm)</div></div>"
-          "<div class='gauge-box'><canvas id='g-heap'></canvas><div class='gauge-lbl'>Freier Heap (KB)</div></div>"
-          "</div></div>"
-          "<div class='card'><h3>Ger&auml;t</h3><table>"
-          "<tr><td>Name</td><td id='s-name'>";
-    h5 += escHtml(deviceName);
-    h5 += "</td></tr><tr><td>Chip</td><td>";
-    h5 += String(ESP.getChipModel());
-    h5 += "</td></tr><tr><td>MAC (WiFi)</td><td style='font-family:monospace'>";
-    h5 += getMacFmt();
-    h5 += "</td></tr><tr><td>IP-Adresse</td><td style='font-family:monospace' id='s-ip'>";
-    h5 += getLocalIp();
-    h5 += "</td></tr><tr><td>WLAN RSSI</td><td id='s-rssi'>";
-    h5 += String(WiFi.RSSI());
-    h5 += " dBm</td></tr><tr><td>Uptime</td><td id='s-uptime'>";
-    h5 += fmtUptime(millis() / 1000UL);
-    h5 += "</td></tr><tr><td>Firmware</td><td>";
-    h5 += FW_VERSION;
-    h5 += "</td></tr></table></div>"
-          "<div class='card'><h3>ESP-NOW &amp; WiFi</h3><table>"
-          "<tr><td>ESP-NOW</td><td>";
-    h5 += espNowReady ? "<span style='color:#3fb950'>&#9679; Aktiv</span>"
-                      : "<span style='color:#f85149'>&#9679; Inaktiv</span>";
-    h5 += "</td></tr><tr><td>WiFi-Kanal</td><td id='s-ch2'>";
-    h5 += String(chD);
-    h5 += " <small style='color:#e3b341'>(alle ESPs = gleicher Kanal)</small>"
-          "</td></tr><tr><td>BSSID-Lock</td><td>";
-    h5 += bssidSection;
-    h5 += "</td></tr><tr><td>Peers</td><td>";
-    h5 += String(peerCount);
-    h5 += " / ";
-    h5 += String(MAX_PEERS);
-    h5 += "</td></tr></table>"
-          "<div style='margin-top:8px;display:flex;gap:8px;flex-wrap:wrap'>"
-          "<button class='btn-sm' onclick='manualSync()'>&#128259; Kanal-Sync</button>"
-          "</div></div></div>\n";
-    webServer.sendContent(h5);
-
-    // ── Chunk 6: Log-Pane ────────────────────────────────────────
-    webServer.sendContent(
-        "<div id='pane-log' class='pane'>"
-        "<div class='card'>"
-        "<div class='chat-header'><h3 style='margin:0'>&#128221; Event-Log</h3>"
-        "<button class='btn-sm' onclick='loadLog()'>&#8635; Aktualisieren</button></div><br>"
-        "<div id='log-list'><div class='empty'>&#8987; Lade...</div></div>"
-        "</div></div>\n"
-    );
-
-    // ── Chunk 7: Call modals + Toast + Script ────────────────────
     {
         String cfg;
-        cfg.reserve(200);
+        cfg.reserve(220);
         cfg = "<script>window.COMM_CFG={mac:'";
         cfg += getMac();
         cfg += "',macFmt:'";
         cfg += getMacFmt();
+        cfg += "',name:'";
+        cfg += escJson(deviceName);
         cfg += "',hub:'http://";
         cfg += hubHost;
         cfg += ":";
@@ -1505,365 +1881,595 @@ td:first-child{color:#8b949e;width:42%}
         cfg += "'};</script>\n";
         webServer.sendContent(cfg);
     }
+
     webServer.sendContent(R"rawjs(
-<div id="call-modal" class="modal-overlay">
-  <div class="modal">
-    <div class="call-avatar" id="call-avatar">&#128222;</div>
-    <h2 id="call-title">Eingehender Anruf</h2>
-    <p id="call-from">-</p>
-    <div class="call-btns">
-      <button class="btn-call" onclick="acceptCall()">Annehmen</button>
-      <button class="btn-hangup" onclick="rejectCall()">Ablehnen</button>
-    </div>
+<div id="call-modal" class="modal-overlay"><div class="modal">
+  <div class="call-av" id="call-avatar">&#9742;</div>
+  <h2 id="call-title">Eingehender Anruf</h2>
+  <p id="call-from">-</p>
+  <div class="call-btns">
+    <button class="btn" onclick="acceptCall()">Annehmen</button>
+    <button class="btn danger" onclick="rejectCall()">Ablehnen</button>
   </div>
-</div>
-<div id="active-call-modal" class="modal-overlay">
-  <div class="modal" style="max-width:420px">
-    <h2 id="active-call-name">Anruf</h2>
-    <p id="active-call-duration">00:00</p>
-    <div class="rtc-media">
-      <video id="rtc-remote" autoplay playsinline></video>
-      <video id="rtc-local" autoplay playsinline muted></video>
-    </div>
-    <div class="call-btns">
-      <button class="btn-sm" id="rtc-cam-btn" onclick="toggleCam()">Kamera</button>
-      <button class="btn-sm" id="rtc-mic-btn" onclick="toggleMic()">Mikro</button>
-      <button class="btn-hangup" onclick="endCall()">Auflegen</button>
-    </div>
-    <div class="rtc-hint">Audio/Video im Browser (WebRTC). Signaling &uuml;ber ESP-Hub.</div>
+</div></div>
+<div id="active-call-modal" class="modal-overlay"><div class="modal">
+  <h2 id="active-call-name">Anruf</h2>
+  <p id="active-call-duration">00:00</p>
+  <p id="rtc-status" class="rtc-hint" style="margin:0 0 8px">Verbinde...</p>
+  <div id="rtc-warn" class="rtc-hint" style="display:none;color:var(--warn);margin-bottom:8px"></div>
+  <div class="rtc-media">
+    <video id="rtc-remote" autoplay playsinline></video>
+    <video id="rtc-local" autoplay playsinline muted></video>
   </div>
-</div>
+  <audio id="rtc-remote-audio" autoplay playsinline></audio>
+  <div class="call-btns">
+    <button class="btn ghost" id="rtc-cam-btn" onclick="toggleCam()">Kamera</button>
+    <button class="btn ghost" id="rtc-mic-btn" onclick="toggleMic()">Mikro</button>
+    <button class="btn danger" onclick="endCall()">Auflegen</button>
+  </div>
+  <div class="rtc-hint">Audio/Video im Browser · Signaling ueber ESP-Hub</div>
+</div></div>
 <div id="toast"></div>
 <script>
-// ── Tab-Switching ──────────────────────────────────────────────
-function showTab(id,btn){
-  document.querySelectorAll('.pane').forEach(p=>p.classList.remove('active'));
-  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-  document.getElementById('pane-'+id).classList.add('active');
-  if(btn)btn.classList.add('active');
-}
-
-// ── Toast ──────────────────────────────────────────────────────
-function toast(msg,ok){
-  var t=document.getElementById('toast');
-  t.textContent=msg;
-  t.style.background=ok?'#238636':'#b91c1c';
-  t.classList.add('show');
-  setTimeout(()=>t.classList.remove('show'),2500);
-}
-
-// ── Emoji ──────────────────────────────────────────────────────
-function addEmoji(e){
-  var t=document.getElementById('msg-text');
-  t.value+=e; t.focus();
-}
-
-// ── Senden ────────────────────────────────────────────────────
-function sendMsg(){
-  var to=document.getElementById('sel-to').value;
-  var txt=document.getElementById('msg-text').value.trim();
-  if(!txt){toast('Bitte Text eingeben',false);return;}
-  fetch('/api/send',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({to,text:txt})})
-  .then(r=>r.json()).then(d=>{
-    if(d.ok){toast('\u2714 Gesendet!',true);document.getElementById('msg-text').value='';}
-    else toast('Fehler: '+d.error,false);
-  }).catch(()=>toast('Verbindungsfehler',false));
-}
-
-// ── Gelesen / Chat leeren ──────────────────────────────────────
-function markRead(){
-  fetch('/api/mark-read',{method:'POST'}).then(()=>{
-    document.getElementById('ucnt').textContent='0';
-    var ub=document.getElementById('ubadge');if(ub)ub.remove();
-  });
-}
-function clearChat(){
-  if(!confirm('Chat-Verlauf wirklich l\u00f6schen?'))return;
-  fetch('/api/clear-chat',{method:'POST'}).then(()=>{
-    document.getElementById('msg-list').innerHTML='<div class="empty">Chat geleert</div>';
-    document.getElementById('ucnt').textContent='0';
-    var ub=document.getElementById('ubadge');if(ub)ub.remove();
-  });
-}
-
-function normMac(m){return String(m||'').replace(/[^a-fA-F0-9]/g,'').toUpperCase();}
-
-function selectPeer(mac,name){
-  document.getElementById('sel-to').value=mac;
-  showTab('chat',document.querySelector('.tab'));
-  document.getElementById('msg-text').focus();
-  toast('\u2192 Empf\u00e4nger: '+name,true);
-}
-
-// ── Chat rendern ──────────────────────────────────────────────
-function renderChat(msgs){
-  var el=document.getElementById('msg-list');
-  if(!msgs||!msgs.length){
-    el.innerHTML='<div class="empty">Noch keine Nachrichten<br><small>Warte auf andere ESPs...</small></div>';
-    return;
-  }
-  el.innerHTML=msgs.map(m=>{
-    var age=m.age||0;
-    var as=age<60?age+'s':age<3600?Math.floor(age/60)+'min':Math.floor(age/3600)+'h';
-    var isSent=m.sent===true;
-    var cls='msg'+(isSent?' sent':(m.read?'':' unread'));
-    var badge=isSent?'<span class="badge bc-green">gesendet</span>'
-      :(m.bc?'<span class="badge bc-purple">broadcast</span>':'<span class="badge bc-blue">direkt</span>');
-    var name=isSent?'<span class="msg-from me">Ich</span>':`<span class="msg-from">${m.from}</span>`;
-    return `<div class="${cls}">
-      <div class="msg-head">${name}
-        <div class="msg-meta">${badge}<span>${as}</span></div></div>
-      <div class="msg-text">${m.text}</div></div>`;
-  }).join('');
-}
-
-// ── canvas-gauges ─────────────────────────────────────────────
-var rssiGauge, heapGauge;
-function initGauges(){
-  rssiGauge = new RadialGauge({
-    renderTo:'g-rssi', width:160, height:160,
-    minValue:-100, maxValue:0, majorTicks:['-100','-80','-60','-40','-20','0'],
-    minorTicks:4, strokeTicks:true,
-    highlights:[
-      {from:-100,to:-80,color:'rgba(248,81,73,.4)'},
-      {from:-80, to:-60,color:'rgba(227,179,65,.4)'},
-      {from:-60, to:0,  color:'rgba(63,185,80,.4)'}
-    ],
-    colorPlate:'#161b22', colorNeedle:'#58a6ff', colorNeedleEnd:'#58a6ff',
-    colorMajorTicks:'#8b949e', colorMinorTicks:'#444',
-    colorNumbers:'#e6edf3', colorTitle:'#8b949e',
-    colorUnits:'#8b949e', colorValueText:'#e6edf3',
-    colorValueBoxBackground:'#0d1117',
-    borders:false, needleType:'arrow', needleWidth:2,
-    animationDuration:500, animationRule:'linear',
-    valueDecimals:0, units:'dBm',
-    value:)rawjs");
-
-    webServer.sendContent(String(WiFi.RSSI()));
-
-    webServer.sendContent(R"rawjs(
-  }).draw();
-
-  heapGauge = new LinearGauge({
-    renderTo:'g-heap', width:120, height:200,
-    minValue:0, maxValue:320,
-    majorTicks:['0','64','128','192','256','320'],
-    minorTicks:4, strokeTicks:true,
-    highlights:[
-      {from:0,  to:64, color:'rgba(248,81,73,.4)'},
-      {from:64, to:128,color:'rgba(227,179,65,.4)'},
-      {from:128,to:320,color:'rgba(63,185,80,.4)'}
-    ],
-    colorPlate:'#161b22', colorBar:'#21262d', colorBarProgress:'#58a6ff',
-    colorMajorTicks:'#8b949e', colorMinorTicks:'#444',
-    colorNumbers:'#e6edf3', colorValueText:'#e6edf3',
-    colorValueBoxBackground:'#0d1117',
-    borders:false, barStroke:0, barWidth:8,
-    needleType:null, animationDuration:500, animationRule:'linear',
-    valueDecimals:0, units:'KB',
-    value:)rawjs");
-
-    webServer.sendContent(String(ESP.getFreeHeap() / 1024));
-
-    webServer.sendContent(R"rawjs(
-  }).draw();
-}
-// Gauges erst initialisieren wenn Status-Tab geöffnet wird
-document.querySelectorAll('.tab')[2].addEventListener('click',function(){
-  if(!rssiGauge)setTimeout(initGauges,100);
-});
-
-// ── WebRTC Call (Browser media + Hub signaling + ESP-NOW ring) ─
 var CFG=window.COMM_CFG||{};
 var MY_MAC=normMac(CFG.mac||'');
 var HUB_BASE=CFG.hub||'';
+var peers=[], msgs=[], logs=[], activePeer=null, activeName='';
+var desktop=window.matchMedia('(min-width:860px)').matches;
+window.addEventListener('resize',function(){desktop=window.matchMedia('(min-width:860px)').matches;syncViews();});
+
+function normMac(m){return String(m||'').replace(/[^a-fA-F0-9]/g,'').toUpperCase();}
+function sameMac(a,b){
+  if(a==='bc'||b==='bc') return String(a).toLowerCase()==='bc'&&String(b).toLowerCase()==='bc';
+  return normMac(a)===normMac(b);
+}
+function peerKey(p){return p==='bc'?'bc':normMac(p);}
+function toast(msg,ok){
+  var t=document.getElementById('toast');
+  t.textContent=msg; t.style.background=ok?'#0a4f4a':'#b42318';
+  t.classList.add('show'); setTimeout(function(){t.classList.remove('show');},2400);
+}
+function initials(name){
+  var p=String(name||'?').trim().split(/\s+/);
+  return ((p[0]||'?')[0]+(p[1]?p[1][0]:'')).toUpperCase();
+}
+function ageStr(age){
+  age=age||0;
+  return age<60?age+'s':age<3600?Math.floor(age/60)+'min':Math.floor(age/3600)+'h';
+}
+function msgPeer(m){
+  if(m.peer) return m.peer;
+  if(m.bc) return 'bc';
+  return m.sent ? null : m.mac;
+}
+function threadMsgs(key){
+  return msgs.filter(function(m){
+    var p=msgPeer(m); if(!p) return false;
+    return sameMac(p,key);
+  });
+}
+function unreadFor(key){
+  return threadMsgs(key).filter(function(m){return !m.sent && !m.read;}).length;
+}
+function lastPreview(key){
+  var t=threadMsgs(key);
+  if(!t.length) return key==='bc' ? 'Nachricht an alle Geraete' : 'Tippen zum Chatten';
+  var m=t[0];
+  var prefix=m.sent?'Du: ':(m.bc?(m.from+': '):'');
+  return prefix+(m.text||'');
+}
+function macTail(mac){
+  if(!mac||mac==='bc') return '';
+  var s=String(mac).toUpperCase();
+  return s.length>=5 ? s.slice(-5) : s;
+}
+
+function syncViews(){
+  var list=document.getElementById('view-list');
+  var chat=document.getElementById('view-chat');
+  if(desktop){
+    list.classList.add('show'); chat.classList.add('show');
+    document.querySelector('.back').style.visibility='hidden';
+  } else {
+    document.querySelector('.back').style.visibility='visible';
+  }
+}
+function showList(){
+  if(desktop){activePeer=null;renderList();renderThread();return;}
+  document.getElementById('view-list').classList.add('show');
+  document.getElementById('view-chat').classList.remove('show');
+  document.getElementById('view-more').classList.remove('show');
+}
+function openChat(mac,name){
+  activePeer=mac; activeName=name||mac;
+  document.getElementById('chat-name').textContent=activeName;
+  var peer=peers.find(function(p){return sameMac(p.mac,mac);});
+  if(mac==='bc'){
+    document.getElementById('chat-sub').innerHTML='Broadcast an alle Teilnehmer';
+  } else {
+    var on=peer&&peer.online;
+    document.getElementById('chat-sub').innerHTML=
+      '<span class="st '+(on?'on':'off')+'">'+(on?'Online':'Offline')+'</span> · <span class="macs">'+esc(mac)+'</span>';
+  }
+  document.getElementById('btn-call').style.display = (mac==='bc')?'none':'inline-block';
+  if(!desktop){
+    document.getElementById('view-list').classList.remove('show');
+    document.getElementById('view-chat').classList.add('show');
+    document.getElementById('view-more').classList.remove('show');
+  }
+  renderList(); renderThread();
+  markRead();
+  setTimeout(function(){var el=document.getElementById('msg'); if(el)el.focus();},50);
+}
+function showMore(){
+  var v=document.getElementById('view-more');
+  v.classList.add('show');
+  if(desktop) v.classList.add('overlay'); else v.classList.remove('overlay');
+  refreshPinUi();
+}
+function hideMore(){
+  var v=document.getElementById('view-more');
+  v.classList.remove('show'); v.classList.remove('overlay');
+}
+
+function renderList(){
+  var q=(document.getElementById('q').value||'').toLowerCase();
+  var el=document.getElementById('clist');
+  var items=[{mac:'bc',name:'Alle',online:true,bc:true}];
+  var sorted=peers.slice().sort(function(a,b){
+    if(!!a.online!==!!b.online) return a.online?-1:1;
+    return String(a.name||'').localeCompare(String(b.name||''));
+  });
+  sorted.forEach(function(p){items.push(p);});
+  items=items.filter(function(p){
+    if(!q) return true;
+    return (p.name||'').toLowerCase().indexOf(q)>=0 || (p.mac||'').toLowerCase().indexOf(q)>=0;
+  });
+  if(!items.length){
+    el.innerHTML='<div class="empty"><strong>Keine Treffer</strong>Andere Suche versuchen</div>';
+    return;
+  }
+  var onlineN=peers.filter(function(p){return p.online;}).length;
+  var head='<div style="padding:4px 8px 10px;color:var(--muted);font-size:12px;font-weight:700">'
+    +onlineN+' von '+peers.length+' online</div>';
+  el.innerHTML=head+items.map(function(p){
+    var key=p.bc?'bc':p.mac;
+    var ur=unreadFor(key);
+    var active=activePeer && sameMac(activePeer,key);
+    var st=p.bc?'<span class="st bc">Broadcast</span>'
+      :(p.online?'<span class="st on">Online</span>':'<span class="st off">Offline</span>');
+    var tail=p.bc?'':'<span class="macs">'+esc(macTail(p.mac))+'</span>';
+    return '<div class="crow'+(active?' active':'')+(p.online||p.bc?'':' offline')+'" onclick="openChat(\''+key+'\',\''+String(p.name||'').replace(/'/g,'')+'\')">'
+      +'<div class="av'+(p.bc?' bc':'')+'">'+initials(p.name)
+      +(p.bc?'':('<span class="dot '+(p.online?'on':'')+'"></span>'))
+      +'</div><div class="cmeta"><div class="n"><span>'+esc(p.name)+'</span>'
+      +(ur?'<span class="pill">'+ur+'</span>':'')+'</div>'
+      +'<div class="p">'+esc(lastPreview(key))+'</div>'
+      +'<div class="subline">'+st+tail+'</div></div></div>';
+  }).join('');
+}
+function esc(s){return String(s||'').replace(/[&<>"']/g,function(c){return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c];});}
+
+function renderThread(){
+  var el=document.getElementById('thread');
+  if(!activePeer){
+    el.innerHTML='<div class="empty"><strong>Willkommen</strong>Waehle links einen Kontakt oder &bdquo;Alle&ldquo; fuer Broadcast.</div>';
+    return;
+  }
+  var list=threadMsgs(activePeer).slice().reverse();
+  if(!list.length){
+    el.innerHTML='<div class="empty"><strong>Noch ruhig hier</strong>Schreib die erste Nachricht an '+esc(activeName)+'.</div>';
+    return;
+  }
+  el.innerHTML=list.map(function(m){
+    var cls=m.sent?'out':'in';
+    var who=(!m.sent && (m.bc||activePeer==='bc')) ? '<div class="fn">'+esc(m.from)+'</div>' : '';
+    var id=m.id||0;
+    return '<div class="bubble '+cls+'" data-id="'+id+'">'+who+esc(m.text)
+      +'<div class="meta"><span>'+ageStr(m.age)+'</span>'
+      +(m.bc?'<span>Broadcast</span>':'')
+      +(id?'<button class="del" title="Loeschen" onclick="event.stopPropagation();deleteMsg('+id+')">Loeschen</button>':'')
+      +'</div></div>';
+  }).join('');
+  el.scrollTop=el.scrollHeight;
+}
+function deleteMsg(id){
+  if(!id) return;
+  if(!confirm('Diese Nachricht loeschen?')) return;
+  fetch('/api/delete-msg',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:id})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){
+      msgs=msgs.filter(function(m){return m.id!==id;});
+      renderList(); renderThread(); toast('Nachricht geloescht',true);
+    } else toast('Loeschen fehlgeschlagen',false);
+  }).catch(function(){toast('Fehler',false);});
+}
+function clearThread(){
+  if(!activePeer){toast('Kein Chat gewaehlt',false);return;}
+  var label=activePeer==='bc'?'Broadcast':'diesen Chat';
+  if(!confirm(label+' wirklich leeren?')) return;
+  fetch('/api/clear-chat',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({peer:activePeer})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){
+      msgs=msgs.filter(function(m){ var p=msgPeer(m); return !(p&&sameMac(p,activePeer)); });
+      renderList(); renderThread(); toast('Chat geleert',true);
+    } else toast('Fehler',false);
+  }).catch(function(){toast('Fehler',false);});
+}
+
+function sendMsg(){
+  if(!activePeer){toast('Erst Kontakt waehlen',false);return;}
+  var txt=document.getElementById('msg').value.trim();
+  if(!txt){toast('Bitte Text eingeben',false);return;}
+  fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({to:activePeer,text:txt}),credentials:'same-origin'})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){document.getElementById('msg').value='';toast('Gesendet',true);}
+    else toast('Fehler: '+(d.error||''),false);
+  }).catch(function(){toast('Verbindungsfehler',false);});
+}
+function toggleEmoji(){
+  var bar=document.getElementById('emoji-bar');
+  if(bar) bar.classList.toggle('open');
+}
+function addEmoji(em){
+  var ta=document.getElementById('msg');
+  if(!ta) return;
+  var start=ta.selectionStart||ta.value.length;
+  var end=ta.selectionEnd||ta.value.length;
+  var v=ta.value;
+  var next=v.slice(0,start)+em+v.slice(end);
+  if(next.length>199) next=next.slice(0,199);
+  ta.value=next;
+  var pos=Math.min(start+em.length, next.length);
+  ta.focus();
+  try{ta.setSelectionRange(pos,pos);}catch(e){}
+}
+function refreshPinUi(){
+  fetch('/api/auth-status',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    var on=!!d.pinEnabled;
+    var hint=document.getElementById('pin-hint');
+    var old=document.getElementById('pin-old');
+    var clr=document.getElementById('pin-clear-btn');
+    if(hint) hint.textContent=on
+      ? 'PIN ist aktiv. Web-UI verlangt Anmeldung. ESP-NOW bleibt geraeteweit.'
+      : 'Noch keine PIN. Optional setzen, um die Web-UI zu schuetzen.';
+    if(old) old.style.display=on?'':'none';
+    if(clr) clr.style.display=on?'':'none';
+  }).catch(function(){});
+}
+function savePin(){
+  var pin=(document.getElementById('pin-new').value||'').trim();
+  var old=(document.getElementById('pin-old').value||'').trim();
+  if(pin.length<4||pin.length>8){toast('PIN 4-8 Ziffern',false);return;}
+  fetch('/api/set-pin',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'set',pin:pin,oldPin:old}),credentials:'same-origin'})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){
+      document.getElementById('pin-new').value='';
+      document.getElementById('pin-old').value='';
+      toast('PIN gespeichert',true);
+      refreshPinUi();
+    } else toast(d.error||'Fehler',false);
+  }).catch(function(){toast('Fehler',false);});
+}
+function clearPin(){
+  var old=(document.getElementById('pin-old').value||'').trim();
+  if(!old){toast('Aktuelle PIN eingeben',false);return;}
+  if(!confirm('PIN wirklich entfernen?')) return;
+  fetch('/api/set-pin',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:'clear',oldPin:old}),credentials:'same-origin'})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){
+      document.getElementById('pin-new').value='';
+      document.getElementById('pin-old').value='';
+      toast('PIN entfernt',true);
+      refreshPinUi();
+    } else toast(d.error||'Fehler',false);
+  }).catch(function(){toast('Fehler',false);});
+}
+function doLogout(){
+  fetch('/api/logout',{method:'POST',credentials:'same-origin'})
+  .then(function(){ location.href='/'; })
+  .catch(function(){ location.href='/'; });
+}
+function markRead(){
+  fetch('/api/mark-read',{method:'POST'}).then(function(){
+    msgs.forEach(function(m){m.read=true;});
+    renderList(); updateStatusBadge();
+  });
+}
+function setMyName(){
+  var name=document.getElementById('my-name').value.trim();
+  if(!name||name.length>31){toast('Name 1-31 Zeichen',false);return;}
+  fetch('/api/set-name',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:name})})
+  .then(function(r){return r.json();}).then(function(d){
+    if(d.ok){toast('Name gespeichert',true);setTimeout(function(){location.reload();},800);}
+    else toast('Fehler',false);
+  });
+}
+function lockBssid(){fetch('/api/bssid-lock',{method:'POST'}).then(function(r){return r.json();}).then(function(d){if(d.ok){toast('AP gesperrt',true);setTimeout(function(){location.reload();},1000);}else toast('Fehler',false);});}
+function clearBssid(){fetch('/api/bssid-clear',{method:'POST'}).then(function(){toast('Lock aufgehoben',true);setTimeout(function(){location.reload();},1000);});}
+function manualSync(){if(!confirm('Kanal-Sync starten? Ca. 30s.'))return;toast('Suche...',true);fetch('/api/channel-sync',{method:'POST'}).then(function(r){return r.json();}).then(function(d){if(d.peers>0){toast('Peers auf Kanal '+d.channel,true);setTimeout(function(){location.reload();},1500);}else toast('Kein passender AP',false);});}
+
+function updateStatus(d){
+  var set=function(id,v){var el=document.getElementById(id); if(el) el.textContent=v;};
+  set('s-ch',d.channel||'?'); set('s-peers',d.peers||0); set('s-recv',d.recv||0); set('s-sent',d.sent||0);
+  set('s-unread',d.unread||0); set('s-rssi',(d.rssi||0)+' dBm'); set('s-ip',d.ip||'');
+  var up=d.uptime||0;
+  set('s-uptime', up<60?up+'s':up<3600?Math.floor(up/60)+'min':Math.floor(up/3600)+'h');
+  var en=document.getElementById('s-espnow');
+  if(en) en.innerHTML=d.espNow?'<span class="ok">Aktiv</span>':'Offline';
+  updateStatusBadge();
+}
+function updateStatusBadge(){}
+function renderLogList(evts){
+  logs=evts||[];
+  var el=document.getElementById('log-list');
+  if(!logs.length){el.innerHTML='<div class="muted">Keine Ereignisse</div>';return;}
+  el.innerHTML=logs.map(function(e){
+    return '<div class="logline"><span>'+esc(e.msg)+'</span><span class="muted">'+ageStr(e.age)+'</span></div>';
+  }).join('');
+}
+
+// WebRTC
 var callMac=null, callName='', callRole=null, callTimer=null, callSeconds=0;
 var pc=null, localStream=null, rtcPoll=null, rtcAfter=0, camOn=true, micOn=true;
-
-function hubUrl(path){return HUB_BASE+path;}
-
+var pendingIce=[], remoteStream=null, ringAudioCtx=null, ringOsc=null;
+function hubUrl(p){return HUB_BASE+p;}
+function setRtcStatus(t){ var el=document.getElementById('rtc-status'); if(el) el.textContent=t||''; }
+function setRtcWarn(t){
+  var el=document.getElementById('rtc-warn'); if(!el) return;
+  if(!t){ el.style.display='none'; el.textContent=''; return; }
+  el.style.display='block'; el.textContent=t;
+}
+function showSecureHint(){
+  var insecure=!window.isSecureContext && location.hostname!=='localhost' && location.hostname!=='127.0.0.1';
+  if(insecure){
+    setRtcWarn('Hinweis: http:// im LAN blockiert oft Mikro/Kamera. In Chrome: chrome://flags → „Insecure origins treated as secure“ → http://'+location.host+' hinzufuegen, dann Chrome neu starten.');
+  } else setRtcWarn('');
+}
 function rtcPost(to,type,payload){
-  if(!HUB_BASE||!MY_MAC)return Promise.reject(new Error('kein Hub'));
-  return fetch(hubUrl('/api/webrtc'),{method:'POST',
-    headers:{'Content-Type':'application/json'},
+  if(!HUB_BASE||!MY_MAC) return Promise.reject(new Error('kein Hub'));
+  return fetch(hubUrl('/api/webrtc'),{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({from:MY_MAC,to:normMac(to),type:type,payload:payload||null})});
 }
-
 function startRtcPoll(){
-  stopRtcPoll();
-  if(!HUB_BASE||!MY_MAC)return;
-  rtcPoll=setInterval(async()=>{
+  stopRtcPoll(); if(!HUB_BASE||!MY_MAC) return;
+  rtcPoll=setInterval(async function(){
     try{
       var r=await fetch(hubUrl('/api/webrtc?mac='+encodeURIComponent(MY_MAC)+'&after='+rtcAfter));
-      var d=await r.json();
-      if(!d.ok||!d.signals)return;
-      for(var i=0;i<d.signals.length;i++){
-        var s=d.signals[i];
-        if(s.id>rtcAfter)rtcAfter=s.id;
-        await handleRtcSignal(s);
-      }
+      var d=await r.json(); if(!d.ok||!d.signals) return;
+      for(var i=0;i<d.signals.length;i++){ var s=d.signals[i]; if(s.id>rtcAfter) rtcAfter=s.id; await handleRtcSignal(s); }
     }catch(e){}
-  },800);
+  },500);
 }
 function stopRtcPoll(){if(rtcPoll){clearInterval(rtcPoll);rtcPoll=null;}}
-
+function stopRingTone(){
+  try{ if(ringOsc){ ringOsc.stop(); ringOsc.disconnect(); } }catch(e){}
+  ringOsc=null;
+  try{ if(ringAudioCtx) ringAudioCtx.close(); }catch(e){}
+  ringAudioCtx=null;
+}
+function startRingTone(){
+  stopRingTone();
+  try{
+    ringAudioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    var o=ringAudioCtx.createOscillator();
+    var g=ringAudioCtx.createGain();
+    o.type='sine'; o.frequency.value=880;
+    g.gain.value=0.04;
+    o.connect(g); g.connect(ringAudioCtx.destination);
+    o.start();
+    ringOsc=o;
+    var pulse=setInterval(function(){
+      if(!ringOsc||!ringAudioCtx) { clearInterval(pulse); return; }
+      g.gain.value = g.gain.value>0.01 ? 0.0 : 0.04;
+    },400);
+    ringOsc._pulse=pulse;
+  }catch(e){}
+}
 async function ensureMedia(){
-  if(localStream)return localStream;
-  localStream=await navigator.mediaDevices.getUserMedia({audio:true,video:{facingMode:'user',width:{ideal:320},height:{ideal:240}}});
+  if(localStream) return localStream;
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
+    throw new Error('getUserMedia nicht verfuegbar (Secure Context?)');
+  }
+  try{
+    localStream=await navigator.mediaDevices.getUserMedia({
+      audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},
+      video:{facingMode:'user',width:{ideal:320},height:{ideal:240}}
+    });
+  }catch(e1){
+    localStream=await navigator.mediaDevices.getUserMedia({
+      audio:{echoCancellation:true,noiseSuppression:true},
+      video:false
+    });
+    toast('Nur Audio — Kamera nicht verfuegbar',true);
+  }
   var lv=document.getElementById('rtc-local');
-  if(lv){lv.srcObject=localStream;lv.muted=true;}
+  if(lv){ lv.srcObject=localStream; lv.muted=true; lv.play().catch(function(){}); }
   return localStream;
 }
-
+function attachRemote(stream){
+  remoteStream=stream;
+  var rv=document.getElementById('rtc-remote');
+  var ra=document.getElementById('rtc-remote-audio');
+  if(rv){
+    rv.srcObject=stream;
+    rv.muted=false;
+    rv.volume=1;
+    rv.play().catch(function(){});
+  }
+  if(ra){
+    ra.srcObject=stream;
+    ra.muted=false;
+    ra.volume=1;
+    ra.play().catch(function(){});
+  }
+  setRtcStatus('Medien empfangen');
+}
+async function flushIce(){
+  if(!pc) return;
+  while(pendingIce.length){
+    var c=pendingIce.shift();
+    try{ await pc.addIceCandidate(c); }catch(e){}
+  }
+}
 function makePc(peerMac){
   if(pc){try{pc.close();}catch(e){}}
-  pc=new RTCPeerConnection({iceServers:[{urls:'stun:stun.l.google.com:19302'}]});
-  pc.onicecandidate=ev=>{
-    if(ev.candidate)rtcPost(peerMac,'ice',ev.candidate).catch(()=>{});
+  pendingIce=[];
+  pc=new RTCPeerConnection({
+    iceServers:[
+      {urls:'stun:stun.l.google.com:19302'},
+      {urls:'stun:stun1.l.google.com:19302'}
+    ]
+  });
+  pc.onicecandidate=function(ev){
+    if(ev.candidate) rtcPost(peerMac,'ice',ev.candidate.toJSON?ev.candidate.toJSON():ev.candidate).catch(function(){});
   };
-  pc.ontrack=ev=>{
-    var rv=document.getElementById('rtc-remote');
-    if(rv)rv.srcObject=ev.streams[0];
-  };
-  pc.onconnectionstatechange=()=>{
-    if(pc&&(pc.connectionState==='failed'||pc.connectionState==='disconnected'||pc.connectionState==='closed')){
-      /* keep UI; user can hang up */
+  pc.ontrack=function(ev){
+    if(ev.streams&&ev.streams[0]) attachRemote(ev.streams[0]);
+    else {
+      if(!remoteStream) remoteStream=new MediaStream();
+      remoteStream.addTrack(ev.track);
+      attachRemote(remoteStream);
     }
+  };
+  pc.onconnectionstatechange=function(){
+    setRtcStatus('Verbindung: '+pc.connectionState);
+    if(pc.connectionState==='connected') toast('Anruf verbunden',true);
+  };
+  pc.oniceconnectionstatechange=function(){
+    setRtcStatus('ICE: '+pc.iceConnectionState);
   };
   return pc;
 }
-
 async function handleRtcSignal(s){
-  if(!callMac||normMac(s.from)!==normMac(callMac))return;
+  if(!callMac||normMac(s.from)!==normMac(callMac)) return;
   if(s.type==='offer'&&callRole==='callee'){
-    await ensureMedia();
-    makePc(callMac);
-    localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
-    await pc.setRemoteDescription(s.payload);
-    var ans=await pc.createAnswer();
-    await pc.setLocalDescription(ans);
-    await rtcPost(callMac,'answer',ans);
+    try{
+      setRtcStatus('Offer empfangen...');
+      await ensureMedia();
+      makePc(callMac);
+      localStream.getTracks().forEach(function(t){pc.addTrack(t,localStream);});
+      await pc.setRemoteDescription(new RTCSessionDescription(s.payload));
+      await flushIce();
+      var ans=await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      await rtcPost(callMac,'answer',{type:ans.type,sdp:ans.sdp});
+      setRtcStatus('Answer gesendet');
+    }catch(e){ setRtcStatus('Fehler: '+e.message); toast('WebRTC: '+e.message,false); showSecureHint(); }
   } else if(s.type==='answer'&&callRole==='caller'){
-    if(pc)await pc.setRemoteDescription(s.payload);
+    try{
+      if(pc){
+        await pc.setRemoteDescription(new RTCSessionDescription(s.payload));
+        await flushIce();
+        setRtcStatus('Answer empfangen');
+      }
+    }catch(e){ setRtcStatus('Answer-Fehler: '+e.message); }
   } else if(s.type==='ice'){
-    if(pc&&s.payload){try{await pc.addIceCandidate(s.payload);}catch(e){}}
-  } else if(s.type==='bye'){
-    cleanupRtc(false);
-    toast('Anruf beendet',false);
-  }
+    if(!s.payload) return;
+    if(!pc || !pc.remoteDescription){ pendingIce.push(s.payload); return; }
+    try{ await pc.addIceCandidate(s.payload); }catch(e){}
+  } else if(s.type==='bye'){ cleanupRtc(false); toast('Anruf beendet',false); }
 }
-
 async function beginRtcAsCaller(){
-  callRole='caller';
-  startRtcPoll();
+  callRole='caller'; startRtcPoll(); showSecureHint();
   try{
+    setRtcStatus('Mikro/Kamera...');
     await ensureMedia();
     makePc(callMac);
-    localStream.getTracks().forEach(t=>pc.addTrack(t,localStream));
-    var offer=await pc.createOffer();
+    localStream.getTracks().forEach(function(t){pc.addTrack(t,localStream);});
+    setRtcStatus('Erstelle Offer...');
+    var offer=await pc.createOffer({offerToReceiveAudio:true,offerToReceiveVideo:true});
     await pc.setLocalDescription(offer);
-    await rtcPost(callMac,'offer',offer);
+    await rtcPost(callMac,'offer',{type:offer.type,sdp:offer.sdp});
+    setRtcStatus('Warte auf Answer...');
   }catch(e){
+    setRtcStatus('Medienfehler');
     toast('Kamera/Mikro: '+e.message,false);
+    showSecureHint();
   }
 }
-
 async function beginRtcAsCallee(){
-  callRole='callee';
-  startRtcPoll();
-  try{await ensureMedia();}catch(e){toast('Kamera/Mikro: '+e.message,false);}
+  callRole='callee'; startRtcPoll(); showSecureHint();
+  try{
+    setRtcStatus('Mikro/Kamera...');
+    await ensureMedia();
+    setRtcStatus('Warte auf Offer...');
+  }catch(e){
+    setRtcStatus('Medienfehler');
+    toast('Kamera/Mikro: '+e.message,false);
+    showSecureHint();
+  }
 }
-
 function cleanupRtc(sendBye){
+  stopRingTone();
   document.getElementById('call-modal').classList.remove('show');
   document.getElementById('active-call-modal').classList.remove('show');
   if(callTimer){clearInterval(callTimer);callTimer=null;}
   stopRtcPoll();
-  if(sendBye&&callMac)rtcPost(callMac,'bye',null).catch(()=>{});
+  if(sendBye&&callMac) rtcPost(callMac,'bye',null).catch(function(){});
   if(pc){try{pc.close();}catch(e){} pc=null;}
-  if(localStream){localStream.getTracks().forEach(t=>t.stop());localStream=null;}
-  var lv=document.getElementById('rtc-local'), rv=document.getElementById('rtc-remote');
-  if(lv)lv.srcObject=null; if(rv)rv.srcObject=null;
+  if(localStream){localStream.getTracks().forEach(function(t){t.stop();});localStream=null;}
+  remoteStream=null; pendingIce=[];
+  var lv=document.getElementById('rtc-local'), rv=document.getElementById('rtc-remote'), ra=document.getElementById('rtc-remote-audio');
+  if(lv) lv.srcObject=null; if(rv) rv.srcObject=null; if(ra) ra.srcObject=null;
   callMac=null; callName=''; callRole=null; callSeconds=0; camOn=true; micOn=true;
+  setRtcStatus(''); setRtcWarn('');
 }
-
+function callCurrent(){ if(activePeer && activePeer!=='bc') startCall(activePeer, activeName); }
 function startCall(mac,name){
-  if(callMac){toast('Bereits im Gespr\u00e4ch',false);return;}
+  if(callMac){toast('Bereits im Gespraech',false);return;}
   if(!HUB_BASE){toast('Kein Hub konfiguriert',false);return;}
-  callMac=mac; callName=name||mac; callRole=null;
+  callMac=mac; callName=name||mac;
   document.getElementById('active-call-name').textContent='Rufe an: '+callName+'...';
   document.getElementById('active-call-duration').textContent='Klingelt...';
+  setRtcStatus('Klingelt...'); showSecureHint();
   document.getElementById('active-call-modal').classList.add('show');
   startRtcPoll();
-  fetch('/api/call',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({to:mac,action:'ring'})})
-  .catch(()=>toast('Fehler',false));
+  fetch('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({to:mac,action:'ring'})}).catch(function(){toast('Fehler',false);});
 }
-
 function acceptCall(){
+  stopRingTone();
   document.getElementById('call-modal').classList.remove('show');
   var mac=document.getElementById('call-modal').dataset.mac;
   var name=document.getElementById('call-from').textContent;
   callMac=mac; callName=name; callSeconds=0;
   document.getElementById('active-call-name').textContent='Verbunden: '+name;
-  startCallTimer();
-  document.getElementById('active-call-modal').classList.add('show');
-  fetch('/api/call',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({to:mac,action:'accept'})})
-  .catch(()=>{});
+  startCallTimer(); document.getElementById('active-call-modal').classList.add('show');
+  fetch('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({to:mac,action:'accept'})}).catch(function(){});
   beginRtcAsCallee();
 }
-
 function rejectCall(){
+  stopRingTone();
   var mac=document.getElementById('call-modal').dataset.mac;
   document.getElementById('call-modal').classList.remove('show');
-  fetch('/api/call',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({to:mac,action:'reject'})})
-  .catch(()=>{});
+  fetch('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({to:mac,action:'reject'})}).catch(function(){});
   callMac=null;
 }
-
 function endCall(){
   if(callMac){
-    fetch('/api/call',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({to:callMac,action:'end'})})
-    .catch(()=>{});
+    fetch('/api/call',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({to:callMac,action:'end'})}).catch(function(){});
   }
   cleanupRtc(true);
 }
-
-function toggleCam(){
-  if(!localStream)return;
-  camOn=!camOn;
-  localStream.getVideoTracks().forEach(t=>t.enabled=camOn);
-  var b=document.getElementById('rtc-cam-btn');
-  if(b)b.textContent=camOn?'Kamera':'Kamera aus';
-}
-function toggleMic(){
-  if(!localStream)return;
-  micOn=!micOn;
-  localStream.getAudioTracks().forEach(t=>t.enabled=micOn);
-  var b=document.getElementById('rtc-mic-btn');
-  if(b)b.textContent=micOn?'Mikro':'Mikro aus';
-}
-
+function toggleCam(){ if(!localStream)return; camOn=!camOn; localStream.getVideoTracks().forEach(function(t){t.enabled=camOn;}); document.getElementById('rtc-cam-btn').textContent=camOn?'Kamera':'Kamera aus'; }
+function toggleMic(){ if(!localStream)return; micOn=!micOn; localStream.getAudioTracks().forEach(function(t){t.enabled=micOn;}); document.getElementById('rtc-mic-btn').textContent=micOn?'Mikro':'Mikro aus'; }
 function startCallTimer(){
-  callSeconds=0;
-  if(callTimer)clearInterval(callTimer);
-  callTimer=setInterval(()=>{
-    callSeconds++;
-    var m=Math.floor(callSeconds/60), s=callSeconds%60;
-    document.getElementById('active-call-duration').textContent=
-      (m<10?'0':'')+m+':'+(s<10?'0':'')+s;
+  callSeconds=0; if(callTimer) clearInterval(callTimer);
+  callTimer=setInterval(function(){
+    callSeconds++; var m=Math.floor(callSeconds/60), s=callSeconds%60;
+    document.getElementById('active-call-duration').textContent=(m<10?'0':'')+m+':'+(s<10?'0':'')+s;
   },1000);
 }
-
 function handleCallEvent(data){
   var d=JSON.parse(data);
   if(d.type==='ring'){
@@ -1871,175 +2477,56 @@ function handleCallEvent(data){
     modal.dataset.mac=d.mac;
     document.getElementById('call-title').textContent='Eingehender Anruf';
     document.getElementById('call-from').textContent=d.from;
-    document.getElementById('call-avatar').textContent='\u{1F4DE}';
     modal.classList.add('show');
+    startRingTone();
   } else if(d.type==='accept'){
     document.getElementById('active-call-name').textContent='Verbunden mit '+d.from;
-    startCallTimer();
-    beginRtcAsCaller();
+    startCallTimer(); beginRtcAsCaller();
   } else if(d.type==='end'||d.type==='timeout'||d.type==='reject'){
     cleanupRtc(false);
     toast(d.type==='timeout'?'Kein Annehmen':(d.type==='reject'?'Abgelehnt':'Anruf beendet'),false);
   }
 }
 
-// ── Name ändern ────────────────────────────────────────────────
-function setMyName(){
-  var inp=document.getElementById('my-name-input');
-  var name=inp.value.trim();
-  if(!name||name.length>31){toast('Name 1-31 Zeichen',false);return;}
-  fetch('/api/set-name',{method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({name})})
-  .then(r=>r.json()).then(d=>{
-    if(d.ok){toast('\u2714 Name gespeichert: '+d.name,true);}
-    else toast('Fehler: '+d.error,false);
-  }).catch(()=>toast('Fehler',false));
-}
-
-// ── BSSID + Kanal-Sync ────────────────────────────────────────
-function lockBssid(){
-  fetch('/api/bssid-lock',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.ok){toast('\u2714 AP gesperrt: '+d.bssid,true);setTimeout(()=>location.reload(),1500);}
-    else toast('Fehler',false);
-  }).catch(()=>toast('Fehler',false));
-}
-function clearBssid(){
-  fetch('/api/bssid-clear',{method:'POST'}).then(()=>{
-    toast('Lock aufgehoben',true);setTimeout(()=>location.reload(),1500);
-  }).catch(()=>toast('Fehler',false));
-}
-function manualSync(){
-  if(!confirm('Kanal-Sync starten? Dauert ca. 30s.'))return;
-  toast('Suche\u2026',true);
-  fetch('/api/channel-sync',{method:'POST'}).then(r=>r.json()).then(d=>{
-    if(d.peers>0){toast('\u2714 Peers auf Kanal '+d.channel+'!',true);setTimeout(()=>location.reload(),2000);}
-    else toast('Kein passender AP gefunden',false);
-  }).catch(()=>toast('Fehler',false));
-}
-
-// ── SSE: Server-Sent Events ───────────────────────────────────
 var sse;
 function connectSse(){
   sse=new EventSource('/api/sse');
-  sse.addEventListener('messages',e=>{
-    try{renderChat(JSON.parse(e.data));}catch(ex){}
-    fetch('/api/status').then(r=>r.json()).then(updateStatus);
-  });
-  sse.addEventListener('peers',e=>{
-    try{
-      var peers=JSON.parse(e.data);
-      renderPeerList(peers);
-      updateDropdown(peers);
-    }catch(ex){}
-  });
-  sse.addEventListener('status',e=>{
-    try{updateStatus(JSON.parse(e.data));}catch(ex){}
-  });
-  sse.addEventListener('log',e=>{
-    try{renderLogList(JSON.parse(e.data));}catch(ex){}
-  });
-  sse.addEventListener('call',e=>{
-    try{handleCallEvent(e.data);}catch(ex){console.error('Call SSE:',ex);}
-  });
-  sse.onerror=()=>{
-    setTimeout(connectSse,3000); // Reconnect
-  };
+  sse.addEventListener('messages',function(e){ try{msgs=JSON.parse(e.data); renderList(); renderThread();}catch(ex){} fetch('/api/status').then(function(r){return r.json();}).then(updateStatus); });
+  sse.addEventListener('peers',function(e){ try{peers=JSON.parse(e.data); renderList();
+    if(activePeer&&activePeer!=='bc'){
+      var peer=peers.find(function(p){return sameMac(p.mac,activePeer);});
+      var on=peer&&peer.online;
+      document.getElementById('chat-sub').innerHTML=
+        '<span class="st '+(on?'on':'off')+'">'+(on?'Online':'Offline')+'</span> · <span class="macs">'+esc(activePeer)+'</span>';
+    }
+  }catch(ex){} });
+  sse.addEventListener('status',function(e){ try{updateStatus(JSON.parse(e.data));}catch(ex){} });
+  sse.addEventListener('log',function(e){ try{renderLogList(JSON.parse(e.data));}catch(ex){} });
+  sse.addEventListener('call',function(e){ try{handleCallEvent(e.data);}catch(ex){} });
+  sse.onerror=function(){ setTimeout(connectSse,3000); };
 }
 
-function updateStatus(d){
-  var upd=(id,v)=>{var el=document.getElementById(id);if(el)el.textContent=v;};
-  upd('s-ch',d.channel||'?');
-  upd('s-ch2',d.channel||'?');
-  upd('s-peers',d.peers||0);
-  upd('s-recv',d.recv||0);
-  upd('s-sent',d.sent||0);
-  upd('s-unread',d.unread||0);
-  upd('s-rssi',(d.rssi||0)+' dBm');
-  upd('ucnt',d.unread||0);
-  var uptime=d.uptime||0;
-  var ut=uptime<60?uptime+'s':uptime<3600?Math.floor(uptime/60)+'min '+uptime%60+'s':Math.floor(uptime/3600)+'h '+Math.floor((uptime%3600)/60)+'min';
-  upd('s-uptime',ut);
-  // Gauges aktualisieren
-  if(rssiGauge)rssiGauge.value=d.rssi||0;
-  if(heapGauge)heapGauge.value=Math.round((d.freeHeap||0)/1024);
-  // Unread-Badge
-  var ub=document.getElementById('ubadge');
-  if(d.unread>0){
-    if(!ub){var hdr=document.querySelector('header');var s=document.createElement('span');
-      s.id='ubadge';s.className='badge bc-yellow';hdr.appendChild(s);}
-    document.getElementById('ubadge').textContent='\u2709 '+d.unread+' neu';
-  } else if(ub) ub.remove();
-}
-
-function renderPeerList(peers){
-  var el=document.getElementById('peer-list');
-  var cnt=document.getElementById('peer-cnt');if(cnt)cnt.textContent=peers.length;
-  if(!peers.length){el.innerHTML='<div class="empty">Noch keine Ger\u00e4te</div>';return;}
-  el.innerHTML=peers.map(p=>{
-    var nm=(p.name||'').replace(/'/g,'').replace(/"/g,'');
-    var callBtn=p.online?`<button class="btn-call-sm" onclick="event.stopPropagation();startCall('${p.mac}','${nm}')">\uD83D\uDCDE Anruf</button>`:'';
-    return `<div class="peer-card" onclick="selectPeer('${p.mac}','${nm}')">
-      <div class="peer-dot" style="background:${p.online?'#3fb950':'#555'}"></div>
-      <div style="flex:1"><div class="peer-name">${p.name}</div>
-      <div class="peer-mac">${p.mac}</div></div>
-      <span class="badge ${p.online?'bc-green':'bc-red'}">${p.online?'online':'offline'}</span>
-      ${callBtn}
-    </div>`;
-  }).join('');
-}
-
-function updateDropdown(peers){
-  var sel=document.getElementById('sel-to');
-  var cur=sel.value;
-  sel.innerHTML='<option value="bc">\uD83D\uDCE2 An alle (Broadcast)</option>'
-    +peers.map(p=>`<option value="${p.mac}">${p.name} (${p.mac.substring(12)})</option>`).join('');
-  if([...sel.options].some(o=>o.value===cur))sel.value=cur;
-}
-
-function renderLogList(evts){
-  var el=document.getElementById('log-list');
-  if(!evts||!evts.length){el.innerHTML='<div class="empty">Keine Ereignisse</div>';return;}
-  el.innerHTML=evts.map(e=>{
-    var age=e.age||0;
-    var as=age<60?age+'s':age<3600?Math.floor(age/60)+'min':Math.floor(age/3600)+'h';
-    return `<div class="log-entry"><span class="log-msg">${e.msg}</span><span class="log-age">${as}</span></div>`;
-  }).join('');
-}
-
-function loadPeers(){
-  fetch('/api/peers').then(r=>r.json()).then(p=>{renderPeerList(p);updateDropdown(p);});
-}
-function loadLog(){
-  fetch('/api/events').then(r=>r.json()).then(renderLogList);
-}
-
-// ── Start ─────────────────────────────────────────────────────
+syncViews();
 connectSse();
-// Initial load via REST als Fallback
-fetch('/api/messages').then(r=>r.json()).then(renderChat);
-loadPeers();
-loadLog();
-// Polling als Fallback wenn SSE nicht verbunden
-setInterval(()=>{
-  if(sse&&sse.readyState===1)return; // SSE aktiv - kein Polling
-  fetch('/api/messages').then(r=>r.json()).then(renderChat);
-  fetch('/api/status').then(r=>r.json()).then(updateStatus);
+refreshPinUi();
+fetch('/api/messages').then(function(r){return r.json();}).then(function(m){msgs=m||[]; renderList(); renderThread();});
+fetch('/api/peers').then(function(r){return r.json();}).then(function(p){peers=p||[]; renderList();});
+fetch('/api/events').then(function(r){return r.json();}).then(renderLogList);
+fetch('/api/status').then(function(r){return r.json();}).then(updateStatus);
+setInterval(function(){
+  if(sse&&sse.readyState===1) return;
+  fetch('/api/messages').then(function(r){return r.json();}).then(function(m){msgs=m||[]; renderList(); renderThread();});
+  fetch('/api/status').then(function(r){return r.json();}).then(updateStatus);
 },5000);
-// Status-Polling immer (für Uptime-Anzeige)
-setInterval(()=>{
-  fetch('/api/status').then(r=>r.json()).then(updateStatus);
-},10000);
+setInterval(function(){ fetch('/api/status').then(function(r){return r.json();}).then(updateStatus); },10000);
 </script>
-</body>
-</html>
+</div>
+</body></html>
 )rawjs");
-
-    webServer.sendContent("");
 }
-
 
 void handleOtaPage() {
+    if (pinEnabled() && !sessionValid()) { handleLoginPage(); return; }
     webServer.setContentLength(CONTENT_LENGTH_UNKNOWN);
     webServer.send(200, "text/html; charset=utf-8", "");
     String h = R"rawhtml(<!DOCTYPE html>
@@ -2138,6 +2625,7 @@ function doUpload(){
 }
 
 void handleOtaUpload() {
+    if (!requireAuth()) return;
     HTTPUpload& upload = webServer.upload();
     if (upload.status == UPLOAD_FILE_START) {
         Serial.printf("[OTA] Start: %s\n", upload.filename.c_str());
@@ -2152,6 +2640,7 @@ void handleOtaUpload() {
 }
 
 void handleOtaUploadFinish() {
+    if (!requireAuth()) return;
     if (Update.hasError())
         webServer.send(500, "text/plain", "OTA fehlgeschlagen!");
     else
@@ -2165,6 +2654,7 @@ void handleOtaUploadFinish() {
 // ================================================================
 
 void handleApiSend() {
+    if (!requireAuth()) return;
     if (!webServer.hasArg("plain")) {
         webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Kein Body\"}");
         return;
@@ -2210,26 +2700,79 @@ void handleApiSend() {
 }
 
 void handleApiMessages() {
+    if (!requireAuth()) return;
     webServer.send(200, "application/json", inboxToJson());
 }
 
 void handleApiMarkRead() {
+    if (!requireAuth()) return;
     inboxMarkAllRead();
     webServer.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleApiClearChat() {
+    if (!requireAuth()) return;
+    String peerFilter = "";
+    if (webServer.hasArg("plain")) {
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+        JsonDocument doc;
+#else
+        DynamicJsonDocument doc(192);
+#endif
+        if (deserializeJson(doc, webServer.arg("plain")) == DeserializationError::Ok) {
+            if (!doc["peer"].isNull()) peerFilter = doc["peer"].as<String>();
+        }
+    }
+    if (peerFilter.length() > 0) {
+        int n = inboxClearPeer(peerFilter.c_str());
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Chat-Thread geleert (%d)", n);
+        logEvent(buf);
+        ssePush("messages", inboxToJson());
+        ssePush("status", handleApiStatusJson());
+        webServer.send(200, "application/json", "{\"ok\":true,\"removed\":" + String(n) + "}");
+        return;
+    }
     inboxCount = 0; inboxNext = 0; unreadCount = 0;
     memset(inbox, 0, sizeof(inbox));
     logEvent("Chat-Verlauf geleert");
+    ssePush("messages", inboxToJson());
+    ssePush("status", handleApiStatusJson());
+    webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiDeleteMsg() {
+    if (!requireAuth()) return;
+    if (!webServer.hasArg("plain")) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(128);
+#endif
+    if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+    uint32_t id = doc["id"].as<uint32_t>();
+    if (!id) {
+        webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"id fehlt\"}"); return;
+    }
+    if (!inboxDeleteById(id)) {
+        webServer.send(404, "application/json", "{\"ok\":false,\"error\":\"nicht gefunden\"}"); return;
+    }
+    ssePush("messages", inboxToJson());
+    ssePush("status", handleApiStatusJson());
     webServer.send(200, "application/json", "{\"ok\":true}");
 }
 
 void handleApiPeers() {
+    if (!requireAuth()) return;
     webServer.send(200, "application/json", peersToJson());
 }
 
 void handleApiChannelSync() {
+    if (!requireAuth()) return;
     if (channelSyncRunning) {
         webServer.send(429, "application/json", "{\"ok\":false,\"error\":\"laeuft bereits\"}");
         return;
@@ -2247,6 +2790,7 @@ void handleApiChannelSync() {
 }
 
 void handleApiBssidLock() {
+    if (!requireAuth()) return;
     uint8_t* b = WiFi.BSSID();
     if (!b) { webServer.send(400, "application/json", "{\"ok\":false}"); return; }
     char s[13];
@@ -2258,10 +2802,11 @@ void handleApiBssidLock() {
     char msg[80];
     snprintf(msg, sizeof(msg), "BSSID-Lock gesetzt: %s (Kanal %d)", s, WiFi.channel());
     logEvent(msg);
-    webServer.send(200, "application/json", "{\"ok\":true,\"bssid\":\"\" + lockedBssid + \"\"}");
+    webServer.send(200, "application/json", "{\"ok\":true,\"bssid\":\"" + lockedBssid + "\"}");
 }
 
 void handleApiBssidClear() {
+    if (!requireAuth()) return;
     lockedBssid = "";
     prefs.begin("espcomm", false);
     prefs.putString("bssid", "");
@@ -2271,15 +2816,18 @@ void handleApiBssidClear() {
 }
 
 void handleApiEvents() {
+    if (!requireAuth()) return;
     webServer.send(200, "application/json", eventLogToJson());
 }
 
 void handleApiStatus() {
+    if (!requireAuth()) return;
     webServer.send(200, "application/json", handleApiStatusJson());
 }
 
 // POST /api/call  {to: "MAC", action: "ring"|"accept"|"reject"|"end"}
 void handleApiCall() {
+    if (!requireAuth()) return;
     if (!webServer.hasArg("plain")) {
         webServer.send(400, "application/json", "{\"ok\":false}"); return;
     }
@@ -2336,6 +2884,7 @@ void handleApiCall() {
 
 // POST /api/set-name  {name: "Neuer Name"}
 void handleApiSetName() {
+    if (!requireAuth()) return;
     if (!webServer.hasArg("plain")) {
         webServer.send(400, "application/json", "{\"ok\":false}"); return;
     }
@@ -2377,13 +2926,22 @@ void handleNotFound() {
 // ================================================================
 
 void setupWebServer() {
+    // Cookie-Header fuer Session-Auth sammeln
+    const char* hdrs[] = {"Cookie"};
+    webServer.collectHeaders(hdrs, 1);
+
     webServer.on("/",              HTTP_GET,  handleRoot);
     webServer.on("/ota",           HTTP_GET,  handleOtaPage);
     webServer.on("/ota-upload",    HTTP_POST, handleOtaUploadFinish, handleOtaUpload);
+    webServer.on("/api/auth-status", HTTP_GET,  handleApiAuthStatus);
+    webServer.on("/api/login",       HTTP_POST, handleApiLogin);
+    webServer.on("/api/logout",      HTTP_POST, handleApiLogout);
+    webServer.on("/api/set-pin",     HTTP_POST, handleApiSetPin);
     webServer.on("/api/send",      HTTP_POST, handleApiSend);
     webServer.on("/api/messages",  HTTP_GET,  handleApiMessages);
     webServer.on("/api/mark-read",  HTTP_POST, handleApiMarkRead);
     webServer.on("/api/clear-chat", HTTP_POST, handleApiClearChat);
+    webServer.on("/api/delete-msg", HTTP_POST, handleApiDeleteMsg);
     webServer.on("/api/peers",     HTTP_GET,  handleApiPeers);
     webServer.on("/api/status",    HTTP_GET,  handleApiStatus);
     webServer.on("/api/events",    HTTP_GET,  handleApiEvents);
@@ -2558,6 +3116,7 @@ void setupWifi() {
     String sHost  = prefs.getString("hub_host", hubHost);
     int    sPort  = prefs.getInt   ("hub_port", hubPort);
     lockedBssid   = prefs.getString("bssid",    "");
+    pinHashStored = prefs.getString("pinhash",  "");
     prefs.end();
     deviceName = sName; hubHost = sHost; hubPort = sPort;
 
