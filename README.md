@@ -63,10 +63,10 @@ Schema: `{name}.{version}.{family}.bin` (`esp32` = klassisch/D1 Mini, `esp32s3` 
 
 | Datei | Board |
 |-------|-------|
-| `communicator.1.7.0.esp32.bin` | ESP32 / D1 Mini |
+| `communicator.1.8.0.esp32.bin` | ESP32 / D1 Mini |
 | `communicator.1.8.0.esp32s3.bin` | ESP32-S3 |
 
-> Hinweis: Aktueller Sketch-Stand ist **1.8.0** (ESP32-S3-Bin). Für klassisches ESP32 liegt `1.7.0` bei.
+> Hinweis: Vorkompilierte Bins entsprechen Sketch-Stand **1.8.0**.
 
 ---
 
