@@ -1386,6 +1386,108 @@ void handleLoginPage() {
     webServer.send_P(200, "text/html", (PGM_P)PAGE_LOGIN_GZ, PAGE_LOGIN_GZ_LEN);
 }
 
+void handleApiAuthStatus() {
+    bool logged = sessionValid();
+    String j = "{";
+    j += "\"ok\":true,";
+    j += "\"pinEnabled\":"; j += pinEnabled() ? "true" : "false"; j += ",";
+    j += "\"loggedIn\":"; j += logged ? "true" : "false";
+    j += "}";
+    webServer.send(200, "application/json", j);
+}
+
+void handleApiLogin() {
+    if (!pinEnabled()) {
+        webServer.send(200, "application/json", "{\"ok\":true,\"pinEnabled\":false}");
+        return;
+    }
+    if (!webServer.hasArg("plain")) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(128);
+#endif
+    if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+    String pin = doc["pin"].as<String>();
+    pin.trim();
+    if (hashPin(pin) != pinHashStored) {
+        delay(300);
+        webServer.send(401, "application/json", "{\"ok\":false,\"error\":\"Falsche PIN\"}");
+        return;
+    }
+    String tok = createSession();
+    sendSessionCookie(tok);
+    webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiLogout() {
+    String tok = getCookieValue("comm_sess");
+    if (tok.length()) destroySessionToken(tok);
+    clearSessionCookie();
+    webServer.send(200, "application/json", "{\"ok\":true}");
+}
+
+void handleApiSetPin() {
+    if (!requireAuth()) return;
+    if (!webServer.hasArg("plain")) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument doc;
+#else
+    DynamicJsonDocument doc(192);
+#endif
+    if (deserializeJson(doc, webServer.arg("plain")) != DeserializationError::Ok) {
+        webServer.send(400, "application/json", "{\"ok\":false}"); return;
+    }
+    String action = doc["action"].as<String>(); // set | clear | change
+    String pin = doc["pin"].as<String>();
+    String oldPin = doc["oldPin"].as<String>();
+    pin.trim(); oldPin.trim();
+
+    if (action == "clear") {
+        if (!pinEnabled()) { webServer.send(200, "application/json", "{\"ok\":true}"); return; }
+        if (hashPin(oldPin) != pinHashStored) {
+            webServer.send(401, "application/json", "{\"ok\":false,\"error\":\"Aktuelle PIN falsch\"}");
+            return;
+        }
+        savePinHash("");
+        // alle Sessions invalidieren
+        for (int i = 0; i < MAX_SESSIONS; i++) webSessions[i].used = false;
+        clearSessionCookie();
+        logEvent("PIN entfernt");
+        webServer.send(200, "application/json", "{\"ok\":true,\"pinEnabled\":false}");
+        return;
+    }
+
+    // set or change
+    if (pin.length() < 4 || pin.length() > 8) {
+        webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"PIN 4-8 Zeichen\"}");
+        return;
+    }
+    for (size_t i = 0; i < pin.length(); i++) {
+        if (pin[i] < '0' || pin[i] > '9') {
+            webServer.send(400, "application/json", "{\"ok\":false,\"error\":\"Nur Ziffern\"}");
+            return;
+        }
+    }
+    if (pinEnabled()) {
+        if (hashPin(oldPin) != pinHashStored) {
+            webServer.send(401, "application/json", "{\"ok\":false,\"error\":\"Aktuelle PIN falsch\"}");
+            return;
+        }
+    }
+    savePinHash(hashPin(pin));
+    String tok = createSession();
+    sendSessionCookie(tok);
+    logEvent("PIN gesetzt/geaendert");
+    webServer.send(200, "application/json", "{\"ok\":true,\"pinEnabled\":true}");
+}
+
 void handleRoot() {
     if (pinEnabled() && !sessionValid()) { handleLoginPage(); return; }
     webServer.sendHeader(F("Content-Encoding"), F("gzip"));
