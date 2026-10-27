@@ -1,6 +1,6 @@
 # esp32.communicator
 
-![Version](https://img.shields.io/badge/version-1.8.0-blue)
+![Version](https://img.shields.io/badge/version-1.9.0-blue)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Donate](https://img.shields.io/badge/Donate-PayPal-00457C.svg?logo=paypal)](https://www.paypal.com/donate/?business=martin%40bchmnn.de&currency_code=EUR)
 
@@ -63,10 +63,10 @@ Schema: `{name}.{version}.{family}.bin` (`esp32` = klassisch/D1 Mini, `esp32s3` 
 
 | Datei | Board |
 |-------|-------|
-| `communicator.1.8.0.esp32.bin` | ESP32 / D1 Mini |
-| `communicator.1.8.0.esp32s3.bin` | ESP32-S3 |
+| `communicator.1.9.0.esp32.bin` | ESP32 / D1 Mini |
+| `communicator.1.9.0.esp32s3.bin` | ESP32-S3 |
 
-> Hinweis: Vorkompilierte Bins entsprechen Sketch-Stand **1.8.0**.
+> Hinweis: Vorkompilierte Bins entsprechen Sketch-Stand **1.9.0** (Shared Core + gzip-UI).
 
 ---
 
